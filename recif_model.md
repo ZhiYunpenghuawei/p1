@@ -43,6 +43,27 @@ $$
 这份实现加载的是不带语言模型输出头的 Qwen3-MoE 主干；三个 SID 预测头从独立检查点文件
 加载。它不是通用文本生成模型，也不会输出自然语言 token。
 
+```python
+def load_model_and_heads(ckpt_dir, config_json, device, dtype=torch.bfloat16):
+    ......
+    cfg = Qwen3MoeConfig(**base)
+    cfg.vocab_size = 3 * VOCAB
+    model = Qwen3MoeModel(cfg).to(dtype)
+    model = model.to(device).eval()
+
+
+    ......
+    # 3 external SID heads: Linear(hidden, 8192, bias=False) per byte level.
+    ext = torch.load(os.path.join(ckpt_dir, 'external_rank0.pt'),
+                     map_location='cpu', weights_only=False)
+    head_sd = ext['lm_heads']
+    H = base['hidden_size']
+    heads = torch.nn.ModuleList([torch.nn.Linear(H, VOCAB, bias=False) for _ in range(3)])
+    for k in range(3):
+        heads[k].weight.data.copy_(head_sd[f'heads.{k}.weight'])
+    heads = heads.to(device, dtype=dtype).eval()
+    return model, heads
+```
 
 ## 2. SID 表示与输入序列
 

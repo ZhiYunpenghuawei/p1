@@ -27,6 +27,8 @@ $$
 - **三个外置预测头**：每个预测头都是 `Linear(hidden_size, 8192, bias=False)`，分别预测
   `sa`、`sb` 和 `sc`。
 <img width="1448" height="1086" alt="ChatGPT Image 2026年7月17日 09_51_50" src="https://github.com/user-attachments/assets/29df584c-6c82-4a11-9dfe-b924918ec629" />
+
+增加三个预测头后的架构
 <img width="1672" height="941" alt="ChatGPT Image 2026年7月17日 09_51_55" src="https://github.com/user-attachments/assets/7e68186f-1ea6-4ea8-adb1-45f75ba61ed0" />
 
 

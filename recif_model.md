@@ -43,6 +43,7 @@ $$
 这份实现加载的是不带语言模型输出头的 Qwen3-MoE 主干；三个 SID 预测头从独立检查点文件
 加载。它不是通用文本生成模型，也不会输出自然语言 token。
 
+
 ## 2. SID 表示与输入序列
 
 ### 2.1 SID 的三个分量
@@ -146,7 +147,7 @@ final = min(beam, keep * bf[2])
 单个候选的最终得分为：
 
 $$
-\operatorname{score}(sa,sb,sc)
+\mathrm{score}(sa,sb,sc)
 = \log P(sa \mid H) + \log P(sb \mid H,sa) + \log P(sc \mid H,sa,sb).
 $$
 

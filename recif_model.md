@@ -26,6 +26,10 @@ $$
 - **Qwen3-MoE 主干网络**：把历史 SID token 序列编码为隐藏状态。
 - **三个外置预测头**：每个预测头都是 `Linear(hidden_size, 8192, bias=False)`，分别预测
   `sa`、`sb` 和 `sc`。
+<img width="1448" height="1086" alt="ChatGPT Image 2026年7月17日 09_51_50" src="https://github.com/user-attachments/assets/29df584c-6c82-4a11-9dfe-b924918ec629" />
+<img width="1672" height="941" alt="ChatGPT Image 2026年7月17日 09_51_55" src="https://github.com/user-attachments/assets/7e68186f-1ea6-4ea8-adb1-45f75ba61ed0" />
+
+
 
 三个 SID 层级各自拥有 8192 个取值，但在主干网络的输入嵌入表中使用互不重叠的 token
 区间，因此主干词表大小固定为：

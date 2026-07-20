@@ -33,15 +33,15 @@ $$
 
 
 
-三个 SID 层级各自拥有 8192 个取值，但在主干网络的输入嵌入表中使用互不重叠的 token
+三个 SID 层级各自拥有 8192 个取值，但在主干网络的输入emb表中使用互不重叠的 token
 区间，因此主干词表大小固定为：
 
 $$
 3 \times 8192 = 24576.
 $$
 
-这份实现加载的是不带语言模型输出头的 Qwen3-MoE 主干；三个 SID 预测头从独立检查点文件
-加载。它不是通用文本生成模型，也不会输出自然语言 token。
+这里加载的是不带语言模型输出头的 Qwen3-MoE 主干；三个 SID 预测头从独立检查点文件
+加载。它不是通用文本生成模型，也不会输出自然语言 token，而是生成id。
 
 ```python
 def load_model_and_heads(ckpt_dir, config_json, device, dtype=torch.bfloat16):

@@ -72,8 +72,10 @@ def load_model_and_heads(ckpt_dir, config_json, device, dtype=torch.bfloat16):
 每个分量都位于 `[0, 8191]`，对应 13 位有效值。整数 SID 与三元组之间的转换为：
 
 ```text
+（sa，sb，sc）->sid
 sid = sa | (sb << 14) | (sc << 28)
 
+sid->（sa，sb，sc）
 sa = sid & 0x1FFF
 sb = (sid >> 14) & 0x1FFF
 sc = (sid >> 28) & 0x1FFF

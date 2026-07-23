@@ -43,12 +43,12 @@
 ```mermaid
 flowchart TD
     A[GRLLM.beam_search] --> B[_get_model_architectures]
-    B --> C{RecifForCausalLM?}
+    B --> C{判断是什么模型?}
 
-    C -->|No| D[one_rec.prepare_beam_search_inputs]
+    C -->|one_rec| D[one_rec.prepare_beam_search_inputs]
     D --> E[one_rec.build_beam_search_steps]
 
-    C -->|Yes| F[recif.prepare_beam_search_inputs]
+    C -->|recif| F[recif.prepare_beam_search_inputs]
     F --> G[recif.build_beam_search_steps]
 
     E --> H[创建 BeamSearchInstance]

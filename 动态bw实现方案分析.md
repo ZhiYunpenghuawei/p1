@@ -345,3 +345,279 @@ Step N 使用 W_current 做模型 forward
 ```
 
 推荐先实现“**固定 schedule、同 batch 同宽、有限 BW bucket**”。该方案能获得后期减少 beam forward 的主要收益，同时避免一开始就引入 ragged batch 和完整的动态 KV 管理。
+
+
+
+# 基于 Tree Attention 的动态 Beam Width 设计
+
+## 1. 目标与范围
+
+本文讨论在现有 Tree Attention beam search 上支持“不同生成层采用不同候选保留数”的工程方案。设第 \(d\) 层裁剪后保留的活跃 beam 数为 \(B_d\)，例如：
+
+```text
+depth       0    1    2    3    4+
+beam width  4   16   64   32    8
+```
+
+这里的“层”指生成树的深度，即生成第几个 token，而不是 Transformer 的网络层。本文关注搜索过程、调度器、KV cache 和 Tree Attention 元数据的变化，不讨论动态宽度策略本身如何产生。
+
+## 2. 现有 Tree Attention 基础
+
+固定宽度 beam search 每一步包含以下过程：
+
+1. 当前活跃 beam 分别计算下一个 token 的候选及分数；
+2. 将所有父 beam 的候选展平并做全局 Top-K；
+3. 记录每个入选候选的父 beam，以及该候选 token；
+4. 下一轮通过 parent/child 映射 fork 逻辑分支；
+5. Tree Attention 复用公共前缀 KV，只为各分支维护新增的后缀 KV。
+
+当前实现中的关键抽象是 `fork_info`（父 beam 下标与新 token 的对应关系）以及每个请求携带的活跃 `beam_width`。因此，Tree Attention 本身已经能表达一棵非完整树：一个父节点可没有子节点、只有一个子节点或产生多个子节点。动态宽度的核心不是重写 attention，而是让搜索层和调度层不再假设每一层的活跃分支数恒定。
+
+## 3. 总体方案
+
+### 3.1 配置模型
+
+请求增加按深度索引的宽度序列：
+
+```text
+beam_width_schedule = [B0, B1, ..., Bm]
+```
+
+生成深度超过序列长度时，需要明确一种规则：
+
+- 重复最后一个值；
+- 回退到默认宽度；
+- 将 schedule 视为非法。
+
+推荐重复最后一个值，行为稳定且适合长度未知的生成请求。所有值必须为正整数，并设置服务端上限，避免单层宽度导致显存或候选排序开销失控。
+
+最终返回结果数应与“中间活跃宽度”分开定义。建议保留独立的 `num_return_sequences`；否则应明确最终返回数由最后一层宽度决定。将两者混为同一个 `beam_width`，会在中间宽度小于最终返回数时产生语义冲突。
+
+### 3.2 每层搜索流程
+
+在深度 \(d\)，令上一层活跃 beam 数为 \(B_{d-1}\)，每个父 beam 取 \(K_d\) 个 token 候选。搜索层执行：
+
+```text
+parents(B[d-1])
+    -> logits / per-parent Top-K(K[d])
+    -> flatten candidates(B[d-1] * K[d])
+    -> global Top-K(B[d])
+    -> parent index + token
+    -> fork_info for next tree-attention step
+```
+
+全局裁剪的目标值由固定 `beam_width` 改成当前层的 \(B_d\)。入选项在展平数组中的位置为 \(i\) 时：
+
+```text
+parent_index = i // K_d
+token_index  = i % K_d
+```
+
+不能再使用固定宽度充当候选 stride。若 \(K_d\) 也动态变化，stride 必须作为该步元数据显式传递，否则父节点映射会错误，继而 fork 到错误的 KV 分支。
+
+### 3.3 与 Tree Attention 的衔接
+
+裁剪完成后，只为入选的 \(B_d\) 个候选生成下一步 `fork_info`。下一轮 Tree Attention 读取实际活跃宽度，而不是请求初始宽度：
+
+```text
+active_beam_width = len(fork_info) = B[d]
+```
+
+宽度扩大时，多个新子节点可以引用同一父节点；底层只共享父节点已有 KV，并为各子节点追加后缀。宽度缩小时，未入选分支应从活跃集合移除，其 KV block 引用计数递减；确认不再被活跃分支或已完成序列引用后才能释放。
+
+所以 attention 数学计算本身不需要变化，变化主要集中在：
+
+- 当前步的活跃序列数量；
+- query、slot mapping 和 block table 的长度；
+- 父子分支映射；
+- 每个逻辑请求在 batch 中的分段边界；
+- 被淘汰分支的 KV 生命周期。
+
+## 4. 需要修改的模块
+
+### 4.1 API 与参数校验
+
+增加宽度 schedule、最终返回数以及可选的每层候选数 \(K_d\)。校验内容包括：
+
+- schedule 非空且元素为正整数；
+- 最大宽度不超过服务端限制；
+- 最终返回数不超过可能产生的有效完成序列数；
+- graph capture、最大 batch token 和 KV cache 容量能覆盖最大宽度；
+- 在线接口、离线接口和序列化协议语义一致。
+
+### 4.2 Beam 搜索与候选排序
+
+搜索循环需按深度读取 \(B_d\)，并使用它进行全局 Top-K。完成序列和活跃序列必须分开管理：EOS 分支进入 completed 集合后不应占用下一层活跃宽度，但最终排序时仍参与竞争。
+
+若宽度从小变大，扩展能力还受每个父节点输出候选数 \(K_d\) 限制，必须满足：
+
+\[
+B_d \le B_{d-1}K_d
+\]
+
+否则期望宽度无法达到。Catalog、语法约束或大量 EOS 还可能使有效候选数进一步下降，因此运行时实际宽度应允许小于配置宽度。
+
+### 4.3 调度器与批处理元数据
+
+固定宽度实现容易预先按 `batch_size × beam_width` 分配和切片。动态宽度后，每个请求的宽度、深度和完成状态都可能不同，需要使用 prefix-sum/offset 描述 ragged batch：
+
+```text
+request offsets = [0, B0, B0+B1, ...]
+```
+
+请求在每一步都要更新：
+
+- 活跃 beam 数；
+- logits 输出分段；
+- fork 的父下标；
+- request-to-sequence 映射；
+- query length、slot mapping 和 block table offset。
+
+这是实现中最容易出现跨请求数据串位的部分。不能用 batch 内最大宽度简单推导每个请求的真实边界，除非明确 padding 并在排序及 fork 时屏蔽 padding 项。
+
+### 4.4 KV Cache 管理
+
+动态宽度不改变公共前缀共享原则，但增加了引用计数变化的频率：
+
+- 扩宽：同一父 block table 被多个子分支引用；
+- 缩宽：一次释放多个淘汰分支；
+- EOS：分支从活跃集合转入完成集合；
+- early stop：整个请求的剩余分支统一回收。
+
+若完成序列只保留 token、分数和 parent pointer，通常无需继续持有其完整 KV；若后续存在回溯或重新扩展，则必须延长 KV 生命周期。实现时要明确 completed beam 是否仍拥有 KV。
+
+### 4.5 Kernel 与 CUDA Graph
+
+若现有 Tree Attention kernel 接受每请求宽度数组和 offset，通常无需修改核心 kernel，只需传递真实 shape。若 kernel 将 beam width 编译为常量，或 CUDA Graph 只捕获固定形状，则需要：
+
+- 为若干宽度 bucket 预捕获 graph；
+- 对宽度做 padding 并提供有效 mask；
+- 或对不匹配宽度回退 eager execution。
+
+完全动态 shape 会减少 graph 复用率；全量 padding 则浪费算力。工程上通常采用宽度 bucket，例如 8/16/32/64，并将 \(B_d\) 向上取整到最近 bucket。
+
+## 5. 实现难度
+
+整体难度为中高。若现有 Tree Attention 已显式携带 parent/child 映射和实际活跃宽度，搜索层改造属于中等难度；真正复杂的是 batch、KV 生命周期和图捕获。
+
+| 部分 | 难度 | 原因 |
+|---|---:|---|
+| 参数与按层 Top-K | 低至中 | 将固定 K 改为按深度读取，逻辑直接 |
+| parent/child 映射 | 中 | 动态候选 stride 和重复父节点必须正确 |
+| Ragged batch 元数据 | 高 | 不同请求宽度不同，offset 易错 |
+| KV cache fork/free | 高 | 扩宽、缩宽、EOS 并发改变引用关系 |
+| CUDA Graph/静态 shape | 高 | 动态宽度降低图复用，需 bucket 或 fallback |
+| 分布式 TP/DP 同步 | 中至高 | 各 rank 必须得到一致的 Top-K 和分支顺序 |
+| 正确性验证 | 高 | 组合状态多，错误常表现为静默生成偏差 |
+
+相比从普通 attention 新建 Tree Attention，动态宽度不需要重新解决公共前缀共享，因此难度明显较低；但它会打破固定宽度在内存布局、batch 切片和 graph capture 上带来的大量简化。
+
+## 6. 复杂度分析
+
+设生成深度为 \(D\)，第 \(d\) 层裁剪后的活跃宽度为 \(B_d\)，每个父 beam 的候选数为 \(K_d\)，词表大小为 \(V\)，当前上下文长度为 \(L_d\)。
+
+### 6.1 候选生成和裁剪
+
+若 logits 已计算，只分析候选选择：
+
+- 每父节点词表 Top-K：约为 \(O(B_{d-1}V)\)，具体常数取决于 kernel；
+- 候选合并数量：\(C_d=B_{d-1}K_d\)；
+- 使用 partial Top-K/selection：期望 \(O(C_d)\) 或 kernel 相关的 \(O(C_d\log B_d)\)；
+- 完整排序：\(O(C_d\log C_d)\)，不推荐。
+
+总候选处理量为：
+
+\[
+O\left(\sum_{d=1}^{D} B_{d-1}K_d\right)
+\]
+
+固定宽度 \(B\)、固定候选数 \(K\) 时退化为 \(O(DBK)\)。动态宽度只有在多数层的 \(B_d\) 小于固定基线时才降低总量；单层扩到很大仍会造成明显峰值。
+
+### 6.2 Tree Attention 计算
+
+在共享公共前缀 KV 的前提下，每层 query 数与活跃 beam 数成正比。抽象表示为：
+
+\[
+T_{\text{attn}}
+=
+O\left(\sum_{d=1}^{D} B_{d-1}L_dH\right)
+\]
+
+其中 \(H\) 表示与 head 数、head dimension 有关的因子。相较固定宽度：
+
+\[
+O\left(B\sum_{d=1}^{D}L_dH\right)
+\]
+
+动态宽度节省比例主要由 \(\sum B_d\) 决定，而不是最大宽度决定。但 kernel padding 或宽度 bucket 会使实际计算量接近 \(\sum \widehat{B_d}\)，其中 \(\widehat{B_d}\) 是向上取整后的物理宽度。
+
+### 6.3 KV Cache 空间
+
+公共 prompt KV 只保存一份。若每层每个活跃分支追加一个 token，理想化的增量 KV 空间为：
+
+\[
+S_{\text{KV}}
+=
+O\left(S_{\text{prompt}}+\sum_{d=1}^{D}B_d\right)
+\]
+
+实际峰值还取决于 block 粒度、copy-on-write、延迟释放和 completed beam 是否持有 KV。动态宽度的平均空间可能下降，但最大瞬时空间至少要按：
+
+\[
+O\left(S_{\text{prompt}}+D\cdot \max_d B_d\right)
+\]
+
+做保守容量规划。若某层突然扩宽，可能出现 KV block 分配尖峰。
+
+### 6.4 元数据与通信
+
+每步 parent/child、slot mapping、block table 等元数据规模为 \(O(B_d)\)，总量为：
+
+\[
+O\left(\sum_{d=1}^{D}B_d\right)
+\]
+
+在张量并行中，候选分数归并和 Top-K 通信还与 \(B_{d-1}K_d\) 有关。为了保证各 rank 的分支顺序一致，分数相同场景必须定义稳定的 tie-break 规则。
+
+## 7. 主要风险
+
+1. **父下标计算错误**：仍使用固定候选 stride，会 fork 到错误分支。
+2. **EOS 占用活跃配额**：completed 与 active 未分离，导致下一层宽度小于预期。
+3. **宽度扩大但候选不足**：\(B_d>B_{d-1}K_d\)，配置目标不可达。
+4. **KV 提前释放或泄漏**：淘汰、完成、取消请求的生命周期交叉。
+5. **batch 分段错位**：不同请求动态变化后仍按固定宽度切 logits。
+6. **CUDA Graph 抖动**：宽度种类过多造成频繁 capture 或 eager fallback。
+7. **峰值显存低估**：只按平均宽度估算，没有考虑最大宽度和 block 碎片。
+8. **非确定性排序**：并列分数在不同设备上产生不同 parent/child 顺序。
+
+## 8. 建议的落地顺序
+
+第一阶段只让 \(B_d\) 动态，保持每父 beam 的候选数 \(K\) 为请求级固定值，并以 schedule 最大值作为候选输出容量。这样能够先验证搜索、fork 和 KV 生命周期，代价是窄层的 logits Top-K 输出仍有浪费。
+
+第二阶段引入 ragged batch 和宽度 bucket，减少 padding，并验证多请求混合、EOS、取消、抢占和 prefix cache 命中场景。
+
+第三阶段再让 \(K_d\) 动态，并改造 SamplingParams、logprob 输出 shape、kernel 和 remux 协议。这部分侵入性最大，不应与第一阶段同时推进。
+
+## 9. 测试要求
+
+至少覆盖：
+
+- 宽度单调增加、单调减少和反复变化；
+- 多个子 beam 共享同一父节点；
+- schedule 比生成长度短或长；
+- EOS、catalog 过滤造成有效候选不足；
+- batch 内不同请求处在不同深度和宽度；
+- 请求取消、抢占、KV swap/recompute；
+- TP、DP 和单卡结果一致；
+- graph bucket 与 eager 路径结果一致；
+- 动态宽度全设为同一值时，与原固定宽度实现逐 token、逐分数一致；
+- KV block 在请求结束后无泄漏。
+
+## 10. 结论
+
+Tree Attention 已经提供公共前缀 KV 共享及显式父子分支关系，因此实现动态 beam width 不需要改变 attention 的数学定义。最小改动是在每层全局 Top-K 后生成不同长度的 `fork_info`，并把真实活跃宽度传给下一步。
+
+工程难点不在“每层取不同的 K”本身，而在固定宽度假设散布于候选 stride、batch 切片、KV 引用计数、内存预分配和 CUDA Graph shape 中。若现有系统的 Tree Attention 元数据已经是 ragged/offset 形式，整体属于中等改造；若 kernel、调度器和 graph 都将宽度固化，则属于高复杂度改造。
+
+性能收益由各层宽度之和 \(\sum B_d\) 决定，显存容量则仍应按最大宽度与最坏分支生命周期规划。建议分阶段实现：先动态活跃宽度，再优化 ragged/bucket，最后才考虑动态每父候选数。
+

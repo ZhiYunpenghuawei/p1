@@ -23,28 +23,49 @@
 
 ## 2. 总体架构
 
-```mermaid
-flowchart LR
-    Caller[调用者]
-    Offline[离线 GRLLM.beam_search]
-    Online[在线原生 /v1/completions]
-    Adapter[OneRec / RECIF 模型策略]
-    RecifOnline[RECIF 异步搜索]
-    Shared[公共 Beam 候选选择]
+总体架构对应本 PR 的两个目标：第一部分是离线 Beam Search 公共化，第二部分是
+RECIF 从模型加载到离线、在线推理的完整接入。
 
-    Caller --> Offline
-    Caller --> Online
-    Offline --> Adapter
-    Adapter --> Shared
-    Online -->|仅 RECIF 分派| RecifOnline
-    RecifOnline --> Shared
+```mermaid
+flowchart TB
+    subgraph OfflineRefactor[离线 Beam Search 公共化]
+        Entry[统一入口 GRLLM.beam_search]
+        Adapter[ModelAdapter<br/>OneRec / RECIF 差异]
+        Trunk[公共多层主干<br/>_run_beam_search_steps]
+        Step[公共单步转移<br/>apply_beam_search_step]
+
+        Entry --> Adapter
+        Adapter --> Trunk
+        Trunk --> Step
+    end
+
+    subgraph RecifSupport[RECIF 模型支持]
+        Plugin[plugin 注册]
+        Checkpoint[本地 RECIF checkpoint]
+        Model[RecifForCausalLM<br/>权重转换与三头合并]
+        OfflineCall[RECIF 离线调用]
+        NativeAPI[原生 /v1/completions]
+        Handler[RECIF handler 分派]
+        AsyncSearch[RECIF 异步 Beam Search]
+
+        Plugin --> Model
+        Checkpoint --> Model
+        OfflineCall --> Entry
+        NativeAPI --> Handler
+        Handler --> AsyncSearch
+    end
+
+    Model -.模型执行.-> Trunk
+    Model -.模型执行.-> AsyncSearch
+    AsyncSearch --> Step
 ```
 
-总体上只有两条入口：
+图中需要关注四个边界：
 
-- 离线入口通过 `ModelAdapter` 隔离 OneRec 和 RECIF 的输入、分层策略与输出差异。
-- 在线入口继续使用 vLLM 原生路由，只在当前模型为 RECIF 时进入 RECIF 异步搜索。
-- 两条 RECIF 路径以及普通离线路径最终复用公共候选选择逻辑。
+- `GRLLM.beam_search()` 是 OneRec 和 RECIF 的统一离线入口。
+- `ModelAdapter` 只处理搜索前后的模型差异，公共主干不判断模型类型。
+- RECIF 在线请求复用原生 `/v1/completions`，不会增加新的 HTTP 路由。
+- 离线普通路径和 RECIF 在线路径复用 `apply_beam_search_step()` 的候选选择逻辑。
 
 ## 3. 离线 Beam Search 公共化
 
@@ -156,38 +177,94 @@ Adapter 只抽取公共主干真正需要的两类差异：
 
 ### 3.4 `GRLLM.beam_search()` 调用流程
 
+改造前，输入处理、搜索循环、候选剪枝和输出解码全部写在一个
+`GRLLM.beam_search()` 中：
+
 ```mermaid
-sequenceDiagram
-    participant Caller as 调用者
-    participant GR as GRLLM.beam_search
-    participant Adapter as ModelAdapter
-    participant Engine as LLM.generate
-    participant Step as apply_beam_search_step
-
-    Caller->>GR: prompts + BeamSearchParams
-    GR->>Adapter: build_beam_search_inputs()
-    Adapter-->>GR: prepared + steps + EOS/catalog 策略
-    GR->>GR: 初始化 BeamSearchInstance
-    GR->>GR: 按 concurrency_limit 分批
-
-    alt OneRec 且 Custom Attention 可用
-        GR->>GR: _custom_beam_search_batch()
-    else 普通公共路径
-        loop 每个 BeamSearchStep
-            GR->>Engine: generate(max_tokens=1, allowed_token_ids=...)
-            Engine-->>GR: 当前父 Beam 的 FlatLogprobs
-            GR->>Step: 父 Beam + 输出 + 当前 step
-            Step-->>GR: active + completed
-        end
-    end
-
-    GR->>Adapter: build_beam_search_outputs()
-    Adapter-->>Caller: BeamSearchOutput
+flowchart LR
+    Old[旧 GRLLM.beam_search]
+    Old --> Input[OneRec 输入与 tokenizer]
+    Old --> Loop[多层 generate 循环]
+    Old --> Prune[候选计分与剪枝]
+    Old --> Output[OneRec 输出解码]
 ```
 
-`GRLLM.beam_search()` 现在只保留公共控制流程：
+改造后，调用关系变为下面这棵函数调用树：
 
-- 选择 Adapter；
+```mermaid
+flowchart TB
+    Init[GRLLM.__init__]
+    Factory[create_model_adapter]
+    Adapter[保存为 self.model_adapter]
+    Entry[GRLLM.beam_search<br/>统一外部入口]
+
+    InputDispatch{调用当前 Adapter 的<br/>build_beam_search_inputs}
+    OneBuild[OneRecModelAdapter<br/>build_beam_search_inputs]
+    RecifBuild[RecifModelAdapter<br/>build_beam_search_inputs]
+    OneInput[one_rec.prepare_beam_search_inputs<br/>one_rec.build_beam_search_steps]
+    RecifInput[recif.prepare_beam_search_inputs<br/>recif.build_beam_search_steps]
+
+    Instances[初始化 BeamSearchInstance<br/>按 concurrency_limit 分批]
+    Backend{是否使用 OneRec<br/>Custom Attention}
+    Custom[_custom_beam_search_batch<br/>保留原 OneRec 优化路径]
+    Trunk[_run_beam_search_steps<br/>公共多层搜索主干]
+    Generate[llm.generate<br/>每次只生成 1 token]
+    Transition[apply_beam_search_step<br/>公共计分与剪枝]
+
+    OutputDispatch{调用当前 Adapter 的<br/>build_beam_search_outputs}
+    OneFinalize[OneRecModelAdapter<br/>build_beam_search_outputs]
+    RecifFinalize[RecifModelAdapter<br/>build_beam_search_outputs]
+    OneOutput[one_rec.finalize_beam_search_outputs]
+    RecifOutput[recif.finalize_beam_search_outputs]
+    Result[BeamSearchOutput]
+
+    Init --> Factory
+    Factory -->|OneRecModelAdapter 或 RecifModelAdapter| Adapter
+    Adapter -.供入口使用.-> Entry
+
+    Entry --> InputDispatch
+    InputDispatch -->|OneRec| OneBuild
+    InputDispatch -->|RECIF| RecifBuild
+    OneBuild --> OneInput
+    RecifBuild --> RecifInput
+    OneInput --> Instances
+    RecifInput --> Instances
+
+    Instances --> Backend
+    Backend -->|是| Custom
+    Backend -->|否| Trunk
+    Trunk --> Generate
+    Generate --> Transition
+
+    Custom --> OutputDispatch
+    Transition --> OutputDispatch
+    OutputDispatch -->|OneRec| OneFinalize
+    OutputDispatch -->|RECIF| RecifFinalize
+    OneFinalize --> OneOutput
+    RecifFinalize --> RecifOutput
+    OneOutput --> Result
+    RecifOutput --> Result
+```
+
+按照实际执行顺序，可以归纳为四步：
+
+1. `GRLLM.__init__()` 根据 `beam_search_model` 创建
+   `OneRecModelAdapter` 或 `RecifModelAdapter`。
+2. 外部统一调用 `GRLLM.beam_search()`，入口首先调用当前 Adapter 的
+   `build_beam_search_inputs()`：
+   - OneRec Adapter 调用 `models/one_rec.py` 的输入准备和固定宽度步骤函数；
+   - RECIF Adapter 调用 `models/recif.py` 的 prefix 准备和三层步骤函数。
+3. `GRLLM.beam_search()` 初始化 Beam 后进入搜索：
+   - OneRec 且 Custom Attention 可用时保留 `_custom_beam_search_batch()`；
+   - 其他情况调用新抽出的 `_run_beam_search_steps()`；
+   - `_run_beam_search_steps()` 每层调用一次 `llm.generate()`，随后调用
+     `apply_beam_search_step()` 完成公共候选计分和剪枝。
+4. 搜索完成后，入口调用 Adapter 的 `build_beam_search_outputs()`，再分别进入
+   OneRec 或 RECIF 的 `finalize_beam_search_outputs()`。
+
+因此，`GRLLM.beam_search()` 现在只保留公共控制流程：
+
+- 调用 Adapter 准备输入和分层配置；
 - 创建 `BeamSearchInstance`；
 - 处理并发批次；
 - 选择 Custom Attention 或普通 `LLM.generate()` 路径；

@@ -24,64 +24,31 @@
 ## 2. 总体架构
 
 ```mermaid
-flowchart TB
-    User[调用者]
+flowchart LR
+    Caller[调用者]
+    Offline[离线 GRLLM.beam_search]
+    Online[在线原生 /v1/completions]
+    Adapter[OneRec / RECIF 模型策略]
+    RecifOnline[RECIF 异步搜索]
+    Shared[公共 Beam 候选选择]
 
-    subgraph Offline[离线推理]
-        GRLLM[GRLLM.beam_search]
-        Adapter[ModelAdapter]
-        SharedLoop[_run_beam_search_steps]
-        CustomLoop[_custom_beam_search_batch]
-    end
-
-    subgraph Online[在线推理]
-        API[原生 POST /v1/completions]
-        NativeHandler[OpenAIServingCompletion]
-        RecifDispatch[RECIF completion handler]
-        AsyncLoop[recif_beam_search]
-    end
-
-    subgraph Shared[公共 Beam 逻辑]
-        StepConfig[BeamSearchStep]
-        Transition[apply_beam_search_step]
-        Decisions[候选提取 / 累积分数 / EOS / Top-K / 子 Beam 创建]
-    end
-
-    subgraph Models[模型策略]
-        OneRec[OneRecModelAdapter]
-        Recif[RecifModelAdapter]
-        RecifModel[RecifForCausalLM]
-    end
-
-    User --> GRLLM
-    User --> API
-    GRLLM --> Adapter
-    Adapter --> OneRec
-    Adapter --> Recif
-    GRLLM -->|普通 generate 路径| SharedLoop
-    GRLLM -->|OneRec Custom Attention 可用| CustomLoop
-    SharedLoop --> Transition
-    Transition --> Decisions
-    StepConfig --> SharedLoop
-    StepConfig --> AsyncLoop
-
-    API --> NativeHandler
-    NativeHandler -->|RECIF 模型| RecifDispatch
-    NativeHandler -->|其他模型| NativeHandler
-    RecifDispatch --> AsyncLoop
-    AsyncLoop --> Transition
-    AsyncLoop --> RecifModel
+    Caller --> Offline
+    Caller --> Online
+    Offline --> Adapter
+    Adapter --> Shared
+    Online -->|仅 RECIF 分派| RecifOnline
+    RecifOnline --> Shared
 ```
 
-这里有三个不同层次：
+总体上只有两条入口：
 
-- `ModelAdapter` 负责离线搜索前后的模型差异。
-- `_run_beam_search_steps()` 和 RECIF 在线 `recif_beam_search()` 负责多步编排。
-- `apply_beam_search_step()` 只负责一次“展开、计分、剪枝”状态转移。
+- 离线入口通过 `ModelAdapter` 隔离 OneRec 和 RECIF 的输入、分层策略与输出差异。
+- 在线入口继续使用 vLLM 原生路由，只在当前模型为 RECIF 时进入 RECIF 异步搜索。
+- 两条 RECIF 路径以及普通离线路径最终复用公共候选选择逻辑。
 
-## 4. 离线 Beam Search 公共化
+## 3. 离线 Beam Search 公共化
 
-### 4.1 改造前的问题
+### 3.1 改造前的问题
 
 原来的 `GRLLM.beam_search()` 同时负责：
 
@@ -102,7 +69,7 @@ flowchart TB
 - 每层使用不同的词表区间。
 - 输出需要从三个 token 还原为一个 int64 SID，而不是 tokenizer decode。
 
-### 4.2 公共数据结构
+### 3.2 公共数据结构
 
 `vllm_gr/entrypoints/beam_search_config.py` 增加三个核心结构。
 
@@ -149,7 +116,7 @@ class BeamSearchStep:
 - `prompt_texts`：OneRec 最终拼接输出时使用；
 - `tokenizer`、`begin_token_id`、`end_token_id`：OneRec 可选状态。
 
-### 4.3 ModelAdapter 边界
+### 3.3 ModelAdapter 边界
 
 ```mermaid
 classDiagram
@@ -187,7 +154,7 @@ Adapter 只抽取公共主干真正需要的两类差异：
 
 约束本身仍保留在各模型文件中，没有继续拆成大量细粒度策略类。
 
-### 4.4 `GRLLM.beam_search()` 调用流程
+### 3.4 `GRLLM.beam_search()` 调用流程
 
 ```mermaid
 sequenceDiagram
@@ -226,7 +193,7 @@ sequenceDiagram
 - 选择 Custom Attention 或普通 `LLM.generate()` 路径；
 - 调用 Adapter 构建最终输出。
 
-### 4.5 公共多步循环 `_run_beam_search_steps()`
+### 3.5 公共多步循环 `_run_beam_search_steps()`
 
 每个 `BeamSearchStep` 的执行过程如下：
 
@@ -242,7 +209,7 @@ sequenceDiagram
 5. OneRec 存在 catalog 时，为每个父 Beam 计算动态允许集合。
 6. 调用 `apply_beam_search_step()` 完成一次公共状态转移。
 
-### 4.6 公共单步转移 `apply_beam_search_step()`
+### 3.6 公共单步转移 `apply_beam_search_step()`
 
 ```mermaid
 flowchart LR
@@ -276,7 +243,7 @@ flowchart LR
 - `active`：进入下一层的 Beam；
 - `completed`：因 stop/EOS 已完成的 Beam。
 
-## 5. OneRec 行为保持
+## 4. OneRec 行为保持
 
 OneRec 的模型差异被移动到 `vllm_gr/models/one_rec.py`，而不是改变其语义。
 
@@ -304,9 +271,9 @@ BeamSearchStep(
 - OneRec 在线逻辑仍由已有 `OpenAIServing.beam_search()` 补丁处理，本 PR 的 RECIF
   completion 分派不会覆盖它。
 
-## 6. RECIF 模型结构
+## 5. RECIF 模型结构
 
-### 6.1 SID 表示
+### 5.1 SID 表示
 
 一个 int64 SID 被拆成三个取值范围为 `[0, 8191]` 的分量：
 
@@ -328,7 +295,7 @@ sid = sa | (sb << 14) | (sc << 28)
 FULL_VOCAB = 3 * 8192 = 24576
 ```
 
-### 6.2 历史 prefix
+### 5.2 历史 prefix
 
 每个历史 item 编码为四个 token：
 
@@ -345,7 +312,7 @@ FULL_VOCAB = 3 * 8192 = 24576
 离线调用者只提供 `history_sids`，`RecifModelAdapter` 内部调用 `build_prefix()`，无需
 调用者了解 token 区间。
 
-### 6.3 模型内置分层搜索配置
+### 5.3 模型内置分层搜索配置
 
 RECIF 将以下配置保留在 `vllm_gr/models/recif.py`：
 
@@ -371,7 +338,7 @@ min(当前全部候选数, beam_width)
 `branch_factors`、层数和 allowed-token 范围不再由调用者通过
 `BeamSearchParams` 传入，避免把模型结构泄漏到公共接口。
 
-### 6.4 为什么 allowed token 必须在引擎计分前生效
+### 5.4 为什么 allowed token 必须在引擎计分前生效
 
 RECIF 每一层对应一个独立的 8192 类输出头。三个头在 vLLM 中合并为一个
 24576 类 `lm_head` 后，必须先屏蔽其他两层 token，再计算 processed logprobs。
@@ -403,9 +370,9 @@ SamplingParams(
 是当前层范围内的分数。OneRec 的动态 catalog 约束则仍可在引擎返回候选后按父 Beam
 处理，两者最终复用相同的全局排序和剪枝函数。
 
-## 7. RECIF 检查点与权重转换
+## 6. RECIF 检查点与权重转换
 
-### 7.1 检查点布局
+### 6.1 检查点布局
 
 RECIF 当前仅支持本地目录，不直接支持 Hugging Face model ID。目录必须包含：
 
@@ -422,7 +389,7 @@ checkpoint/
 `validate_recif_checkpoint()` 在模型构造开始时检查本地目录和必要文件，避免模型
 初始化到中途才因缺失权重失败。
 
-### 7.2 模型继承与注册
+### 6.2 模型继承与注册
 
 `RecifForCausalLM` 继承 vLLM 原生 `Qwen3MoeForCausalLM`：
 
@@ -437,7 +404,7 @@ checkpoint/
 RecifForCausalLM -> vllm_gr.models.recif:RecifForCausalLM
 ```
 
-### 7.3 权重转换流程
+### 6.3 权重转换流程
 
 ```mermaid
 flowchart TB
@@ -476,7 +443,7 @@ flowchart TB
 - 同时存在合并后的 `lm_head.weight` 和独立 heads；
 - 既没有合并 head，也没有独立 heads。
 
-## 8. RECIF 离线推理
+## 7. RECIF 离线推理
 
 离线示例位于：
 
@@ -509,9 +476,9 @@ GRLLM(
 调用者只提供历史 SID 和最终 `beam_width`，RECIF Adapter 自动完成 prefix、三层步骤
 和 SID 输出还原。
 
-## 9. RECIF 在线推理
+## 8. RECIF 在线推理
 
-### 9.1 路由设计
+### 8.1 路由设计
 
 RECIF 不再注册 `/v1/recif/beam_search`，也不抢先注册另一个同路径路由，而是复用：
 
@@ -556,7 +523,7 @@ sequenceDiagram
 - `RequestOutput -> CompletionResponse` 转换；
 - usage 统计。
 
-### 9.2 在线请求约束
+### 8.2 在线请求约束
 
 当前 RECIF 在线请求要求：
 
@@ -580,7 +547,7 @@ sequenceDiagram
 }
 ```
 
-### 9.3 异步搜索编排
+### 8.3 异步搜索编排
 
 `entrypoints/recif/serving_engine.py`：
 
@@ -599,9 +566,9 @@ sequenceDiagram
 - `apply_beam_search_step()`；
 - SID 编解码。
 
-## 10. 测试与 CI
+## 9. 测试与 CI
 
-### 10.1 单元测试
+### 9.1 单元测试
 
 `tests/test_recif_model_support.py` 覆盖：
 
@@ -623,7 +590,7 @@ sequenceDiagram
 - engine outputs 数量错误；
 - 缺少 logprobs 的错误处理。
 
-### 10.2 模型 E2E
+### 9.2 模型 E2E
 
 `tests/system/run_recif_e2e.sh` 执行：
 
@@ -643,7 +610,7 @@ sequenceDiagram
 - 每个预期 SID 的名次漂移不能超过 2；
 - 不使用浮点累计分数作为门禁判定，减少硬件数值差异导致的误报。
 
-### 10.3 CI 接入
+### 9.3 CI 接入
 
 `.github/workflows/pre-commit.yml` 增加两个步骤：
 
@@ -659,6 +626,22 @@ sequenceDiagram
 工作流会先检查 `config.json`、`_model_rank0.pt` 和 `external_rank0.pt`，然后安装
 `requirements/recif.txt` 并执行系统测试。权重不进入 Git 仓库，也不需要在 PR 中
 配置 SSH 凭据。
+
+## 10. 代码结构
+
+代码按职责分为五部分：
+
+| 模块 | 主要文件 | 职责 |
+| --- | --- | --- |
+| 离线入口 | `entrypoints/gr.py` | Beam 实例初始化、分批和多层搜索编排 |
+| 公共搜索 | `beam_search_config.py`、`beam_search_step.py` | 分层配置和单步候选选择 |
+| 模型策略 | `models/model_adapter.py`、`models/one_rec.py` | 隔离 OneRec/RECIF 离线差异 |
+| RECIF 模型 | `models/recif.py` | 权重转换、SID、prefix 和三层约束 |
+| RECIF 在线 | `entrypoints/recif/` | 原生 completion 分派及异步搜索 |
+| 测试门禁 | `tests/`、`.github/workflows/pre-commit.yml` | 单测、离线/在线 E2E 和 CI |
+
+原先 RECIF 专用的 `api_router.py` 和 `protocol.py` 已删除，在线请求统一复用 vLLM
+原生 `/v1/completions` 路由与协议。
 
 ## 11. 文件变更说明
 

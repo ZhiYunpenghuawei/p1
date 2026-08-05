@@ -1,794 +1,481 @@
-# RECIF 模型支持与离线 Beam Search 公共化设计说明
-
-## 1. PR 概述
-
-本 PR 主要完成两件事情：
-
-1. 为 vllm-gr 增加 RECIF 模型支持，包括模型注册、检查点校验、Megatron
-   权重转换、SID 编解码、离线推理、在线推理以及端到端测试。
-2. 整理 `GRLLM.beam_search()` 的离线实现，将模型无关的搜索主干与
-   OneRec、RECIF 各自的输入、分层配置和输出处理分离，使两个模型复用同一套
-   Beam Search 调度与候选选择逻辑。
+RECIF Model and Shared Beam Search Design
+1. 文档目的
+本文说明当前 PR 中两部分核心改动：
+
+在 vllm-gr 中支持 RECIF 模型的加载、离线 beam search 和在线服务。
+整理 GRLLM.beam_search()，让普通模型和具有分层搜索策略的模型复用公共搜索主干，并使 CUSTOM 后端支持 RECIF。
+当前设计遵循以下边界：
+
+vllm-gr 负责模型执行、候选计算、全局 beam 排序、剪枝和 KV Cache 优化。
+RECIF 的层数、每层分支数和每层 token 范围属于模型搜索语义。
+SID 与 token ID 的相互转换属于调用方，不属于通用推理框架。
+原始训练权重到 Hugging Face 权重的转换是离线部署操作，不在模型加载时执行。
+2. 总体设计
+原始 RECIF checkpoint
+  ├── config.json
+  ├── _model_rank0.pt
+  └── external_rank0.pt
+            │
+            │ tools/convert_recif_checkpoint.py
+            ▼
+标准运行时 checkpoint
+  ├── config.json             architectures = ["RecifForCausalLM"]
+  └── model.safetensors       Qwen3-MoE backbone + 合并后的 lm_head
+            │
+            ▼
+vLLM general plugin
+  ├── 注册 RecifForCausalLM
+  └── 注册 RECIF BeamSearchStep builder
+            │
+      ┌─────┴─────────────┐
+      ▼                   ▼
+离线 GRLLM.beam_search   在线 /v1/completions
+      │                   │
+      └───────┬───────────┘
+              ▼
+      RECIF 分层搜索策略
+      expand: 8 / 8 / 8
+      keep:   8 / 64 / 64（beam_width=64 时）
+      range:  level 0 / level 1 / level 2
+              │
+              ▼
+      原始生成 token IDs
+              │
+              │ 调用方 recif_utils
+              ▼
+             SID
+RECIF 与普通 OneRec 搜索的公共部分是：
+
+使用 BeamSearchStep 表示单层策略；
+每个父 beam 扩展候选；
+候选分数加上父 beam 累积分数；
+在所有父 beam 的候选之间做全局 Top-K；
+创建下一层 beam 并记录父子关系；
+CUSTOM 后端复用 grouped beam 和 KV Cache。
+主要区别是约束时机：
+
+RECIF:
+allowed_token_ids → vLLM 屏蔽其他 token → 返回 top candidates → 全局剪枝
+
+OneRec Catalog:
+返回 top candidates → catalog.valid() 按父 beam 过滤 → 全局剪枝
+3. RECIF 配置的四级归属
+配置按照生命周期分为四类。这样可以避免把模型结构、引擎容量和单次请求混在同一个参数对象中。
+
+3.1 Checkpoint / Hugging Face 模型配置
+这类参数描述神经网络本身，写在转换后 checkpoint 的 config.json 中，由 vLLM 加载模型时读取。
+
+参数	当前含义	传入时机
+architectures	设置为 RecifForCausalLM，用于 vLLM ModelRegistry 选择模型类	checkpoint 转换时写入
+vocab_size	RECIF 输出总词表大小，要求为 3 × 8192 = 24576	模型加载时读取并校验
+tie_word_embeddings	必须为 false，因为三个 SID head 不与输入 embedding 共享	模型加载时读取并校验
+hidden_size	Qwen3-MoE 隐藏层宽度，也是 SID head 的输入宽度	权重转换和模型加载时读取
+num_hidden_layers	Transformer 层数	权重转换和模型加载时读取
+num_attention_heads	Query attention head 数量	权重转换和模型加载时读取
+num_key_value_heads	KV head 数量	权重转换和模型加载时读取
+head_dim	单个 attention head 的维度	权重转换和模型加载时读取
+num_experts	MoE expert 数量	权重转换和模型加载时读取
+其他 Qwen3-MoE 参数	RoPE、激活函数、精度等标准模型配置	由 vLLM/Qwen3-MoE 实现读取
+这些参数不应在每次 beam-search 请求中改变。RecifForCausalLM 继承 vLLM 的 Qwen3MoeForCausalLM，只增加 RECIF 必需的配置校验，不在运行时执行权重格式转换。
+
+3.2 RECIF 模型内在搜索策略
+这类参数描述 RECIF 的分层 SID 空间，目前内化在 vllm_gr/models/recif.py。
+
+参数	当前值	含义
+VOCAB	8192	每一级 SID 的类别数
+NUM_SID_LEVELS	3	RECIF 固定生成三个 SID level
+FULL_VOCAB	24576	三个互不重叠 level 的总词表大小
+_RECIF_BRANCH_FACTORS	(8, 8, 8)	每个父 beam 在每一层扩展8个候选
+_RECIF_ALLOWED_TOKEN_RANGES	[0,8192)、[8192,16384)、[16384,24576)	每层允许参与当前层排序的 token
+RECIF_MAX_LOGPROBS	8	当前模型策略所需的最小 max_logprobs 容量
+build_beam_search_steps() 将这些配置转换成公共结构：
+
+BeamSearchStep(
+    expand_width=8,
+    keep_width=min(当前累计候选数, beam_width),
+    allowed_token_ids=当前层token范围,
+)
+当 beam_width=64 时，三个 step 为：
+
+层	父 beam 数	每个父 beam 扩展	候选上限	最终保留
+Level 0	1	8	8	8
+Level 1	8	8	64	64
+Level 2	64	8	512	64
+branch_factors 在 build_beam_search_steps() 中保留了一个 keyword-only 接口，供未来接入启动级模型配置。目前没有暴露为 GRLLM 参数、命令行参数或 request 参数，生产路径始终使用 (8, 8, 8)。
+
+3.3 引擎启动配置
+这类参数在创建 GRLLM 或启动 API Server 时传入，控制模型实例、引擎能力和执行后端。同一模型实例生命周期内保持不变。
+
+参数	RECIF 推荐值	含义
+model	转换后的 checkpoint_hf	标准 HF checkpoint 路径
+skip_tokenizer_init	True	调用方直接传 prompt_token_ids，运行时不加载 tokenizer
+max_logprobs	至少 8	引擎允许单步返回的最大候选数，必须不小于最大 expand_width
+max_num_seqs	通常不小于目标 beam 数，例如 64	调度器并发序列容量，不代表搜索分支数
+logprobs_mode	processed_logprobs	返回应用 allowed_token_ids 等处理后的分数
+dtype	例如 bfloat16	vLLM 标准模型计算精度
+tensor_parallel_size	按硬件配置	vLLM 标准张量并行规模
+attention_config.backend	默认后端或 CUSTOM	是否启用 vllm-gr grouped beam/KV Cache 优化
+需要特别区分：
+
+max_logprobs=8 是引擎容量上限。
+_RECIF_BRANCH_FACTORS=(8,8,8) 是模型搜索策略。
+max_num_seqs=64 是调度容量。
+它们数值可能相同或相关，但语义不同，不能互相替代。
+当前没有新增 RECIF 专用的公共启动参数。未来如需配置 branch factor，可以在启动阶段把配置传入预留接口，但不应允许单次 request 修改模型层次结构。
+
+3.4 单次 beam-search 请求配置
+这类参数可以在同一个模型实例的不同请求之间变化。
+
+参数	示例	含义
+beam_width / 在线 n	64	最终最多保留或返回多少条序列
+max_tokens	3	最多生成多少层；RECIF 要求等于 NUM_SID_LEVELS
+temperature	0.0	当前 beam search 的分数生成温度
+ignore_eos	True	RECIF 固定生成三层，不因普通 EOS 提前终止
+return_token_ids	在线请求为 true	让 /v1/completions 返回 choices[].token_ids
+stream	当前必须为 false	RECIF 在线 beam search 当前不支持流式响应
+请求级 beam_width 不改变 RECIF 每个父节点扩展8个候选的结构。例如 beam_width=20 时仍然逐层扩展8个，但每层 keep_width 依次为 8、20、20。
+
+3.5 应用层输入输出语义
+SID 转换不是模型参数，也不属于 vllm-gr 运行时。
+
+examples/offline_inference/beam_search/recif_utils.py 提供示例实现：
+
+函数	作用
+sid_to_levels()	将一个 SID 拆成三个 level 值
+levels_to_sid()	将三个 level 值恢复成 SID
+build_prefix()	将历史 SID 转成标准 prompt_token_ids
+generated_tokens_to_sid()	将模型生成的三个 token 转成 SID
+真实业务可以复用该文件，也可以提供自己的 tokenizer/codec。框架的公共输出只依赖生成 token 和累计分数，不在 RecifForCausalLM 或 beam-search 主干中转换 SID。
+
+4. 模型与策略注册
+vllm-gr 通过 general plugin 在每个相关进程启动时执行 initialize_runtime()：
+
+vLLM load_general_plugins()
+  → vllm_gr.plugin.register()
+  → initialize_runtime()
+      ├── 安装 vllm-gr runtime patches
+      └── register_recif_model()
+          ├── ModelRegistry.register_model("RecifForCausalLM", ...)
+          └── register_beam_search_step_builder(
+                  "RecifForCausalLM",
+                  build_beam_search_steps,
+              )
+公共 beam-search 入口不接收 beam_search_model="recif"，也不创建 ModelAdapter。它从：
+
+self.llm_engine.model_config.architectures
+获取当前架构，并在 _MODEL_STEP_BUILDERS 中查询模型注册的策略。
+
+如果找到 RecifForCausalLM，调用 RECIF builder；否则使用普通固定宽度策略：
 
-本次改造遵循以下原则：
-
-- 保留 OneRec 原有行为和 Custom Attention 优化路径。
-- RECIF 的层数、每层扩展数和 token 范围属于模型结构，不暴露在
-  `BeamSearchParams` 中。
-- RECIF 必须先通过 `allowed_token_ids` 约束当前层词表，再由引擎计算该范围内的
-  processed logprobs。
-- 在线服务复用 vLLM 原生 `/v1/completions` 路由、协议和响应转换，不新增专用
-  HTTP 端点。
-- 模型无关的一步 Beam 转移同时被离线和 RECIF 在线推理复用。
-
-## 2. 总体架构
-
-总体架构对应本 PR 的两个目标：第一部分是离线 Beam Search 公共化，第二部分是
-RECIF 从模型加载到离线、在线推理的完整接入。
-
-```mermaid
-flowchart TB
-    subgraph OfflineRefactor[离线 Beam Search 公共化]
-        Entry[统一入口 GRLLM.beam_search]
-        Adapter[ModelAdapter<br/>OneRec / RECIF 差异]
-        Trunk[公共多层主干<br/>_run_beam_search_steps]
-        Step[公共单步转移<br/>apply_beam_search_step]
-
-        Entry --> Adapter
-        Adapter --> Trunk
-        Trunk --> Step
-    end
-
-    subgraph RecifSupport[RECIF 模型支持]
-        Plugin[plugin 注册]
-        Checkpoint[本地 RECIF checkpoint]
-        Model[RecifForCausalLM<br/>权重转换与三头合并]
-        OfflineCall[RECIF 离线调用]
-        NativeAPI[原生 /v1/completions]
-        Handler[RECIF handler 分派]
-        AsyncSearch[RECIF 异步 Beam Search]
-
-        Plugin --> Model
-        Checkpoint --> Model
-        OfflineCall --> Entry
-        NativeAPI --> Handler
-        Handler --> AsyncSearch
-    end
-
-    Model -.模型执行.-> Trunk
-    Model -.模型执行.-> AsyncSearch
-    AsyncSearch --> Step
-```
-
-图中需要关注四个边界：
-
-- `GRLLM.beam_search()` 是 OneRec 和 RECIF 的统一离线入口。
-- `ModelAdapter` 只处理搜索前后的模型差异，公共主干不判断模型类型。
-- RECIF 在线请求复用原生 `/v1/completions`，不会增加新的 HTTP 路由。
-- 离线普通路径和 RECIF 在线路径复用 `apply_beam_search_step()` 的候选选择逻辑。
-
-## 3. 离线 Beam Search 公共化
-
-### 3.1 改造前的问题
-
-原来的 `GRLLM.beam_search()` 同时负责：
-
-- tokenizer 和特殊 token 处理；
-- prompt 预处理；
-- Beam 实例初始化；
-- 每一步调用 `generate()`；
-- catalog 约束；
-- EOS 处理；
-- 候选排序与剪枝；
-- 最终文本解码。
-
-这些逻辑直接围绕 OneRec 编写，RECIF 存在以下差异，无法直接复用：
-
-- RECIF 不使用 tokenizer，而是直接接收 SID 历史。
-- RECIF 固定生成三个层级 token。
-- 每层只扩展 8 个候选，但全局最多保留 `beam_width` 个 Beam。
-- 每层使用不同的词表区间。
-- 输出需要从三个 token 还原为一个 int64 SID，而不是 tokenizer decode。
-
-### 3.2 公共数据结构
-
-`vllm_gr/entrypoints/beam_search_config.py` 增加三个核心结构。
-
-#### `BeamSearchModel`
-
-用于在构造 `GRLLM` 时选择模型策略：
-
-```python
-class BeamSearchModel(StrEnum):
-    ONE_REC = "one_rec"
-    RECIF = "recif"
-```
-
-#### `BeamSearchStep`
-
-描述某一层搜索策略：
-
-```python
-@dataclass(frozen=True)
-class BeamSearchStep:
-    expand_width: int
-    keep_width: int
-    allowed_token_ids: list[int] | None = None
-```
-
-字段含义：
-
-| 字段 | 作用 |
-| --- | --- |
-| `expand_width` | 每个父 Beam 请求多少个候选 logprobs |
-| `keep_width` | 当前层全局剪枝后保留多少个 Beam |
-| `allowed_token_ids` | 引擎计算 logprobs 前允许参与当前层计算的 token |
-
-这里将“扩展宽度”和“保留宽度”分开，是 RECIF 能够表达 `8, 8, 8` 分层扩展、
-最终保留 64 个结果的关键。
-
-#### `PreparedBeamInputs`
-
-统一保存已经转换成 vLLM engine input 的 prompt，以及输出切片和模型相关状态：
-
-- `engine_inputs`：传给 vLLM 的输入；
-- `generated_starts`：Beam 搜索生成部分在 token 序列中的起点；
-- `output_starts`：最终输出切片起点；
-- `prompt_texts`：OneRec 最终拼接输出时使用；
-- `tokenizer`、`begin_token_id`、`end_token_id`：OneRec 可选状态。
-
-### 3.3 ModelAdapter 边界
-
-```mermaid
-classDiagram
-    class ModelAdapter {
-        <<abstract>>
-        +supports_custom_attention: bool
-        +build_beam_search_inputs(llm, prompts, params) CommonBeamSearchInputs
-        +build_beam_search_outputs(instances, prepared, logprobs, beam_width)
-    }
-
-    class OneRecModelAdapter {
-        +supports_custom_attention = true
-    }
-
-    class RecifModelAdapter {
-        +supports_custom_attention = false
-    }
-
-    class CommonBeamSearchInputs {
-        +PreparedBeamInputs prepared
-        +list~BeamSearchStep~ steps
-        +bool ignore_eos
-        +catalog
-    }
-
-    ModelAdapter <|-- OneRecModelAdapter
-    ModelAdapter <|-- RecifModelAdapter
-    ModelAdapter --> CommonBeamSearchInputs
-```
-
-Adapter 只抽取公共主干真正需要的两类差异：
-
-1. 搜索前：把调用者输入转换成公共输入，并提供逐层搜索策略。
-2. 搜索后：把公共 Beam 状态转换成模型最终输出。
-
-约束本身仍保留在各模型文件中，没有继续拆成大量细粒度策略类。
-
-### 3.4 `GRLLM.beam_search()` 调用流程
-
-改造前，输入处理、搜索循环、候选剪枝和输出解码全部写在一个
-`GRLLM.beam_search()` 中：
-
-```mermaid
-flowchart LR
-    Old[旧 GRLLM.beam_search]
-    Old --> Input[OneRec 输入与 tokenizer]
-    Old --> Loop[多层 generate 循环]
-    Old --> Prune[候选计分与剪枝]
-    Old --> Output[OneRec 输出解码]
-```
-
-改造后，调用关系变为下面这棵函数调用树：
-
-```mermaid
-flowchart TB
-    Init[GRLLM.__init__]
-    Factory[create_model_adapter]
-    Adapter[保存为 self.model_adapter]
-    Entry[GRLLM.beam_search<br/>统一外部入口]
-
-    InputDispatch{调用当前 Adapter 的<br/>build_beam_search_inputs}
-    OneBuild[OneRecModelAdapter<br/>build_beam_search_inputs]
-    RecifBuild[RecifModelAdapter<br/>build_beam_search_inputs]
-    OneInput[one_rec.prepare_beam_search_inputs<br/>one_rec.build_beam_search_steps]
-    RecifInput[recif.prepare_beam_search_inputs<br/>recif.build_beam_search_steps]
-
-    Instances[初始化 BeamSearchInstance<br/>按 concurrency_limit 分批]
-    Backend{是否使用 OneRec<br/>Custom Attention}
-    Custom[_custom_beam_search_batch<br/>保留原 OneRec 优化路径]
-    Trunk[_run_beam_search_steps<br/>公共多层搜索主干]
-    Generate[llm.generate<br/>每次只生成 1 token]
-    Transition[apply_beam_search_step<br/>公共计分与剪枝]
-
-    OutputDispatch{调用当前 Adapter 的<br/>build_beam_search_outputs}
-    OneFinalize[OneRecModelAdapter<br/>build_beam_search_outputs]
-    RecifFinalize[RecifModelAdapter<br/>build_beam_search_outputs]
-    OneOutput[one_rec.finalize_beam_search_outputs]
-    RecifOutput[recif.finalize_beam_search_outputs]
-    Result[BeamSearchOutput]
-
-    Init --> Factory
-    Factory -->|OneRecModelAdapter 或 RecifModelAdapter| Adapter
-    Adapter -.供入口使用.-> Entry
-
-    Entry --> InputDispatch
-    InputDispatch -->|OneRec| OneBuild
-    InputDispatch -->|RECIF| RecifBuild
-    OneBuild --> OneInput
-    RecifBuild --> RecifInput
-    OneInput --> Instances
-    RecifInput --> Instances
-
-    Instances --> Backend
-    Backend -->|是| Custom
-    Backend -->|否| Trunk
-    Trunk --> Generate
-    Generate --> Transition
-
-    Custom --> OutputDispatch
-    Transition --> OutputDispatch
-    OutputDispatch -->|OneRec| OneFinalize
-    OutputDispatch -->|RECIF| RecifFinalize
-    OneFinalize --> OneOutput
-    RecifFinalize --> RecifOutput
-    OneOutput --> Result
-    RecifOutput --> Result
-```
-
-按照实际执行顺序，可以归纳为四步：
-
-1. `GRLLM.__init__()` 根据 `beam_search_model` 创建
-   `OneRecModelAdapter` 或 `RecifModelAdapter`。
-2. 外部统一调用 `GRLLM.beam_search()`，入口首先调用当前 Adapter 的
-   `build_beam_search_inputs()`：
-   - OneRec Adapter 调用 `models/one_rec.py` 的输入准备和固定宽度步骤函数；
-   - RECIF Adapter 调用 `models/recif.py` 的 prefix 准备和三层步骤函数。
-3. `GRLLM.beam_search()` 初始化 Beam 后进入搜索：
-   - OneRec 且 Custom Attention 可用时保留 `_custom_beam_search_batch()`；
-   - 其他情况调用新抽出的 `_run_beam_search_steps()`；
-   - `_run_beam_search_steps()` 每层调用一次 `llm.generate()`，随后调用
-     `apply_beam_search_step()` 完成公共候选计分和剪枝。
-4. 搜索完成后，入口调用 Adapter 的 `build_beam_search_outputs()`，再分别进入
-   OneRec 或 RECIF 的 `finalize_beam_search_outputs()`。
-
-因此，`GRLLM.beam_search()` 现在只保留公共控制流程：
-
-- 调用 Adapter 准备输入和分层配置；
-- 创建 `BeamSearchInstance`；
-- 处理并发批次；
-- 选择 Custom Attention 或普通 `LLM.generate()` 路径；
-- 调用 Adapter 构建最终输出。
-
-### 3.5 公共多步循环 `_run_beam_search_steps()`
-
-每个 `BeamSearchStep` 的执行过程如下：
-
-1. 汇总当前批次所有实例的 active beams。
-2. 记录每个实例在扁平 Beam 数组中的区间。
-3. 创建一步 `SamplingParams`：
-   - `max_tokens=1`；
-   - `logprobs=step.expand_width`；
-   - `allowed_token_ids=step.allowed_token_ids`；
-   - `detokenize=False`；
-   - `flat_logprobs=True`。
-4. 对所有父 Beam 批量调用 `LLM.generate()`。
-5. OneRec 存在 catalog 时，为每个父 Beam 计算动态允许集合。
-6. 调用 `apply_beam_search_step()` 完成一次公共状态转移。
-
-### 3.6 公共单步转移 `apply_beam_search_step()`
-
-```mermaid
-flowchart LR
-    Parents[父 Beam 列表]
-    Outputs[引擎 FlatLogprobs]
-    Extract[提取并去重 Top-K]
-    Mask[可选的父 Beam 动态约束]
-    Score[父累计分数 + 当前 logprob]
-    EOS[可选 EOS 完成态处理]
-    TopK[按 keep_width 全局选择]
-    Children[创建新的 BeamSearchSequence]
-
-    Parents --> Score
-    Outputs --> Extract
-    Extract --> Mask
-    Mask --> Score
-    Score --> EOS
-    EOS --> TopK
-    TopK --> Children
-```
-
-该函数复用已有的 `beam_search_decision_utils`：
-
-- `extract_and_dedup_flat_logprobs()`；
-- `complete_eos_candidates()`；
-- `select_top_indices()`；
-- `materialize_selected_beams()`。
-
-返回值 `BeamSearchStepResult` 只包含：
-
-- `active`：进入下一层的 Beam；
-- `completed`：因 stop/EOS 已完成的 Beam。
-
-## 4. OneRec 行为保持
-
-OneRec 的模型差异被移动到 `vllm_gr/models/one_rec.py`，而不是改变其语义。
-
-### 输入
-
-- 继续通过 tokenizer 处理文本或 token prompt。
-- 继续支持 `begin_token` 和 `end_token`。
-- 继续缓存 prompt 文本，最终使用 tokenizer decode。
-
-### 分层策略
-
-OneRec 每一步仍然是固定宽度：
-
-```python
 BeamSearchStep(
     expand_width=beam_width,
     keep_width=beam_width,
 )
-```
+这样 OneRec 不需要专用 adapter，也不会进入 RECIF 的层级 token 范围。
 
-### 约束和优化路径
+5. 离线 beam search 调用流程
+5.1 外部调用链
+history_sids
+  → recif_utils.build_prefix()
+  → {"prompt_token_ids": [...]}
+  → GRLLM.beam_search(prompts, params)
+  → BeamSearchOutput
+  → sequence.tokens
+  → recif_utils.generated_tokens_to_sid()
+调用方传给框架的是标准 vLLM token prompt：
 
-- catalog 约束仍按父 Beam 动态计算，并在候选选择阶段屏蔽非法 token。
-- 当后端为 Custom Attention 时，仍走原有 `_custom_beam_search_batch()`。
-- OneRec 在线逻辑仍由已有 `OpenAIServing.beam_search()` 补丁处理，本 PR 的 RECIF
-  completion 分派不会覆盖它。
-
-## 5. RECIF 模型结构
-
-### 5.1 SID 表示
-
-一个 int64 SID 被拆成三个取值范围为 `[0, 8191]` 的分量：
-
-```text
-sid = sa | (sb << 14) | (sc << 28)
-```
-
-模型词表被划分为三个不重叠区间：
-
-| 层级 | 原始分量 | 模型 token 区间 |
-| --- | --- | --- |
-| level 0 | `sa` | `[0, 8192)` |
-| level 1 | `sb` | `[8192, 16384)`，token 为 `sb + 8192` |
-| level 2 | `sc` | `[16384, 24576)`，token 为 `sc + 16384` |
-
-因此完整模型词表大小为：
-
-```text
-FULL_VOCAB = 3 * 8192 = 24576
-```
-
-### 5.2 历史 prefix
-
-每个历史 item 编码为四个 token：
-
-```text
-[context=0, sa, sb + 8192, sc + 16384]
-```
-
-在历史末尾追加一个目标 context token `0`：
-
-```text
-[history item 1] [history item 2] ... [0]
-```
-
-离线调用者只提供 `history_sids`，`RecifModelAdapter` 内部调用 `build_prefix()`，无需
-调用者了解 token 区间。
-
-### 5.3 模型内置分层搜索配置
-
-RECIF 将以下配置保留在 `vllm_gr/models/recif.py`：
-
-```python
-_RECIF_BRANCH_FACTORS = (8, 8, 8)
-NUM_SID_LEVELS = 3
-```
-
-当全局 `beam_width=64` 时：
-
-| 层级 | 父 Beam 数 | 每个父 Beam 扩展 | 候选总数 | 剪枝后保留 |
-| --- | ---: | ---: | ---: | ---: |
-| level 0 | 1 | 8 | 8 | 8 |
-| level 1 | 8 | 8 | 64 | 64 |
-| level 2 | 64 | 8 | 512 | 64 |
-
-也就是每层保留：
-
-```text
-min(当前全部候选数, beam_width)
-```
-
-`branch_factors`、层数和 allowed-token 范围不再由调用者通过
-`BeamSearchParams` 传入，避免把模型结构泄漏到公共接口。
-
-### 5.4 为什么 allowed token 必须在引擎计分前生效
-
-RECIF 每一层对应一个独立的 8192 类输出头。三个头在 vLLM 中合并为一个
-24576 类 `lm_head` 后，必须先屏蔽其他两层 token，再计算 processed logprobs。
-
-```mermaid
-flowchart LR
-    Logits[24576 logits]
-    Allowed[当前层 allowed_token_ids]
-    Mask[屏蔽另外 16384 个 token]
-    LogSoftmax[在当前 8192 类上归一化]
-    Top8[选择当前层 Top 8]
-
-    Logits --> Mask
-    Allowed --> Mask
-    Mask --> LogSoftmax
-    LogSoftmax --> Top8
-```
-
-因此 RECIF 使用：
-
-```python
-SamplingParams(
-    allowed_token_ids=step.allowed_token_ids,
-    logprobs=8,
+outputs = llm.beam_search(
+    [{"prompt_token_ids": prompt_token_ids}],
+    params,
 )
-```
+5.2 GRLLM.beam_search() 内部调用链
+GRLLM.beam_search()
+  ├── _preprocess_cmpl(prompts)
+  │     标准化 TextPrompt / TokensPrompt
+  │
+  ├── build_beam_search_steps(architectures, max_tokens, beam_width)
+  │     ├── RECIF → recif.build_beam_search_steps()
+  │     └── 其他模型 → 固定宽度 BeamSearchStep
+  │
+  ├── 构造 BeamSearchInstance
+  │
+  ├── 判断 attention backend
+  │     ├── 普通后端 → _run_beam_search_steps()
+  │     └── CUSTOM   → _custom_beam_search_batch()
+  │
+  └── select_best_beams()
+        → BeamSearchOutput
+5.3 普通后端主干
+_run_beam_search_steps() 对每个 BeamSearchStep 执行：
 
-该约束发生在引擎 logits processor 阶段。公共 `apply_beam_search_step()` 收到的已经
-是当前层范围内的分数。OneRec 的动态 catalog 约束则仍可在引擎返回候选后按父 Beam
-处理，两者最终复用相同的全局排序和剪枝函数。
+当前所有 active beams
+  → _build_step_sampling_params(step)
+      logprobs = step.expand_width
+      allowed_token_ids = step.allowed_token_ids
+  → llm.generate(max_tokens=1)
+  → apply_beam_search_step()
+      ├── 读取各父 beam 的候选
+      ├── 累加 parent.cum_logprob
+      ├── 可选 Catalog 动态过滤
+      ├── 全局 Top-K(step.keep_width)
+      └── 生成下一层 beams
+RECIF 的 allowed_token_ids 通过 vLLM 原生 SamplingParams 进入 logits processor。在返回 top candidates 之前，其他 level 的 token 已被屏蔽。
 
-## 6. RECIF 检查点与权重转换
+5.4 CUSTOM 后端主干
+_custom_beam_search_batch() 保持相同的逐层数学逻辑，但改变执行组织方式：
 
-### 6.1 检查点布局
+第0层
+  → ADD_BATCH 提交初始请求并完成共享 prompt prefill
+  → 缓存 session/prefix/KV 状态
 
-RECIF 当前仅支持本地目录，不直接支持 Hugging Face model ID。目录必须包含：
+后续层
+  → 根据上层 fork_info 构造 BeamRequestStepUpdate
+  → 一条 grouped message 描述所有 parent/child beams
+  → EngineCore 复用共享 prefix 和父 beam KV Cache
+  → 返回扁平化的多 beam logprobs
+  → _parse_step_logprobs() 恢复父 beam 归属并累积分数
+  → select_top_indices(step.keep_width)
+  → materialize_selected_beams()
+  → 得到 new_beams 和下一层 fork_info
+CUSTOM 的主要优化包括：
 
-```text
-checkpoint/
-├── config.json
-├── _model_rank0.pt
-└── external_rank0.pt
-```
+多个 beam 作为一个逻辑请求提交，减少请求、通信和 scheduler 管理开销；
+显式携带 parent/child 关系，复用共享 prefix 与 KV Cache；
+使用 step.expand_width，RECIF 每个父 beam 只返回8个候选，而不是返回全局 beam_width 个；
+使用 step.keep_width，支持 8 → 64 → 64 的逐层保留宽度；
+不依赖 tokenizer，只传可选的 eos_token_id；
+普通与 CUSTOM 后端共用 _build_step_sampling_params()，保证 allowed IDs 和扩展宽度一致。
+6. 在线调用流程
+RECIF 复用标准 POST /v1/completions 路由，没有新增 /v1/recif/... 端点。
 
-- `_model_rank0.pt`：Megatron 格式的 headless Qwen3-MoE backbone。
-- `external_rank0.pt`：三个独立的 SID heads，位于 `lm_heads` mapping 中。
+POST /v1/completions
+  → OpenAIServingCompletion._create_completion()
+  → RECIF completion handler patch
+      ├── 通过 model_config.architectures 判断 RecifForCausalLM
+      ├── 校验 use_beam_search / max_tokens / return_token_ids
+      └── recif_beam_search()
+          ├── build_beam_search_steps(3, request.n)
+          ├── 每层 _add_batch_step(max_tokens=1)
+          ├── apply_beam_search_step()
+          └── RequestOutput(text="", token_ids=生成的三个token)
+  → vLLM CompletionResponse
+      └── choices[].token_ids
+  → 客户端 generated_tokens_to_sid()
+在线和离线的执行入口不同：
 
-`validate_recif_checkpoint()` 在模型构造开始时检查本地目录和必要文件，避免模型
-初始化到中途才因缺失权重失败。
+离线入口是同步 GRLLM.beam_search()。
+在线入口基于 vLLM async engine，由 recif_beam_search() 编排。
+但两者复用以下核心语义：
 
-### 6.2 模型继承与注册
+同一个 RECIF build_beam_search_steps()；
+同一个 BeamSearchStep；
+同一个 apply_beam_search_step() 候选累计和剪枝逻辑；
+都只向调用方返回 token IDs，不在框架内部转 SID。
+当前在线限制：
 
-`RecifForCausalLM` 继承 vLLM 原生 `Qwen3MoeForCausalLM`：
+只接受一个 token-ID prompt；
+use_beam_search=true；
+max_tokens=3；
+stream=false；
+echo=false；
+return_token_ids=true。
+7. 权重转换与运行时加载
+7.1 为什么独立转换
+原始 RECIF checkpoint 包含：
 
-- Paged Attention、KV Cache、Tensor Parallel 和 fused MoE 继续使用 vLLM 实现。
-- RECIF 只负责检查配置、转换 backbone 权重并合并输出头。
-- 要求 `vocab_size=24576`。
-- 要求 `tie_word_embeddings=false`，因为三个 SID head 独立于输入 embedding。
+_model_rank0.pt   Megatron 格式 Qwen3-MoE backbone
+external_rank0.pt 三个独立 SID heads
+权重名称转换和 head 合并与推理调度无关，不应在每次模型启动时执行。因此转换逻辑放在：
 
-`plugin.py` 在运行时调用 `register_recif_model()`：
+tools/convert_recif_checkpoint.py
+tools/ 不属于 vllm_gr Python package，运行时模型不会导入该脚本。
 
-```text
-RecifForCausalLM -> vllm_gr.models.recif:RecifForCausalLM
-```
+7.2 转换内容
+转换脚本执行：
 
-### 6.3 权重转换流程
+校验 config.json、_model_rank0.pt、external_rank0.pt。
 
-```mermaid
-flowchart TB
-    Main[_model_rank0.pt]
-    External[external_rank0.pt]
-    Arch[从 config 提取模型结构]
-    Convert[megatron_to_hf]
-    QKV[拆分 interleaved QKV]
-    MLP[拆分 gated MLP gate/up]
-    Experts[转换 MoE experts/router key]
-    Heads[读取 heads.0/1/2.weight]
-    Merge[沿 vocab 维拼接]
-    LMHead[lm_head.weight: 24576 x hidden_size]
-    VLLM[vLLM Qwen3MoeForCausalLM.load_weights]
+根据 config 读取 Qwen3-MoE 层数、head、hidden size 和 expert 数量。
 
-    Main --> Convert
-    Arch --> Convert
-    Convert --> QKV
-    Convert --> MLP
-    Convert --> Experts
-    External --> Heads
-    Heads --> Merge
-    Merge --> LMHead
-    QKV --> VLLM
-    MLP --> VLLM
-    Experts --> VLLM
-    LMHead --> VLLM
-```
+将 Megatron QKV、MLP 和 expert 权重名称转换为 HF Qwen3-MoE 名称。
 
-`prepare_vllm_weights()` 还处理以下错误：
+将三个 [8192, hidden_size] SID head 按 level 顺序拼接为：
 
-- `lm_heads` 不是 mapping；
-- head value 不是 tensor；
-- 三个 head 任意一个缺失；
-- head shape 不是 `[8192, hidden_size]`；
-- 同时存在合并后的 `lm_head.weight` 和独立 heads；
-- 既没有合并 head，也没有独立 heads。
+lm_head.weight: [24576, hidden_size]
+保存 model.safetensors。
 
-## 7. RECIF 离线推理
+将 config.json 的 architectures 写为 RecifForCausalLM。
 
-离线示例位于：
+运行时 RecifForCausalLM 直接继承标准 Qwen3-MoE load_weights()。
 
-```text
-examples/offline_inference/beam_search/offline_recif_beam_search.py
-```
+8. 主要代码结构
+vllm_gr/
+├── entrypoints/
+│   ├── gr.py
+│   │   ├── GRLLM.beam_search
+│   │   ├── _run_beam_search_steps
+│   │   ├── _custom_beam_search_batch
+│   │   └── _build_step_sampling_params
+│   ├── beam_search_config.py
+│   │   ├── BeamSearchStep
+│   │   ├── register_beam_search_step_builder
+│   │   └── build_beam_search_steps
+│   └── recif/
+│       ├── completion_handler.py
+│       └── serving_engine.py
+├── models/
+│   └── recif.py
+│       ├── RecifForCausalLM
+│       ├── build_beam_search_steps
+│       └── register_recif_model
+├── beam_search_step.py
+│   └── apply_beam_search_step
+└── plugin.py
 
-调用方式：
+examples/offline_inference/beam_search/
+├── offline_recif_beam_search.py
+└── recif_utils.py
 
-```bash
+tools/
+└── convert_recif_checkpoint.py
+
+tests/
+├── test_recif_model_support.py
+├── test_shared_beam_step.py
+└── system/
+    ├── run_recif_e2e.sh
+    └── verify_recif_e2e.py
+已经删除的旧抽象包括：
+
+ModelAdapter；
+OneRecModelAdapter；
+RecifModelAdapter；
+beam_search_model=BeamSearchModel.RECIF 显式选择；
+GRLLM.beam_search() 中的 history_sids 特殊输入；
+RECIF 模型加载过程中的动态权重转换；
+RECIF 框架侧的 SID 编码和解码。
+9. 本地测试方法
+下面命令默认在仓库根目录执行。
+
+9.1 安装开发和 RECIF 依赖
+uv venv --seed .venv
+source .venv/bin/activate
+uv pip install vllm==0.22.1
+VLLM_GR_TARGET_DEVICE=cuda uv pip install -e ".[dev]"
+uv pip install -r requirements/recif.txt
+NPU 环境将 VLLM_GR_TARGET_DEVICE 设置为对应平台值。
+
+9.2 代码风格和单元测试
+pre-commit run --all-files
+
+pytest \
+  tests/test_recif_model_support.py \
+  tests/test_shared_beam_step.py
+单元测试覆盖：
+
+SID 编解码和 prefix 构造示例；
+RECIF 三层 allowed-token 范围；
+8/8/8 扩展和 8/64/64 保留策略；
+启动级 branch-factor 预留接口；
+普通模型固定宽度回归；
+RECIF 模型/在线 handler 识别；
+三个 SID head 合并和错误处理；
+共享 beam step 的累计分数、父 beam 归属和全局 Top-K；
+SamplingParams 正确携带 expand_width 和 allowed_token_ids。
+9.3 转换本地 checkpoint
+原始模型假设位于 ../checkpoint：
+
+python tools/convert_recif_checkpoint.py \
+  --input ../checkpoint \
+  --output ../checkpoint_hf
+转换完成后至少应存在：
+
+../checkpoint_hf/config.json
+../checkpoint_hf/model.safetensors
+9.4 离线模型测试
 python ./examples/offline_inference/beam_search/offline_recif_beam_search.py \
-  --model_path /path/to/checkpoint \
+  --model_path ../checkpoint_hf \
   --history 598080194427,628177754964,755993681678 \
   --beam 64
-```
+输出格式：
 
-关键初始化参数：
+rank sid cumulative_logprob
+例如：
 
-```python
-GRLLM(
-    model=model_path,
-    beam_search_model=BeamSearchModel.RECIF,
-    max_logprobs=8,
-    skip_tokenizer_init=True,
-    max_num_seqs=beam_width,
-    logprobs_mode="processed_logprobs",
-)
-```
+0 755993681678 -2.9582809917628765
+1 1574911709347 -4.561697155237198
+2 741270118158 -4.69528728723526
+这里的 SID 是离线示例在框架返回 token 后通过 recif_utils 转换得到的，不是 GRLLM.beam_search() 内部生成的文本。
 
-调用者只提供历史 SID 和最终 `beam_width`，RECIF Adapter 自动完成 prefix、三层步骤
-和 SID 输出还原。
+9.5 启动在线服务
+vllm-gr serve ../checkpoint_hf \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --skip-tokenizer-init \
+  --max-logprobs 8 \
+  --max-num-seqs 64 \
+  --logprobs-mode processed_logprobs
+9.6 在线请求
+调用方先通过 recif_utils.build_prefix() 生成 prompt_token_ids，然后请求标准 completions API：
 
-## 8. RECIF 在线推理
+curl -sS -X POST http://127.0.0.1:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": [0,1915,8558,18612,0,6996,10559,18724,0,7950,13040,19200,0],
+    "use_beam_search": true,
+    "n": 64,
+    "max_tokens": 3,
+    "return_token_ids": true
+  }'
+在线响应中的：
 
-### 8.1 路由设计
-
-RECIF 不再注册 `/v1/recif/beam_search`，也不抢先注册另一个同路径路由，而是复用：
-
-```text
-POST /v1/completions
-```
-
-`plugin.py` 仅给 vLLM 原生 `OpenAIServingCompletion._create_completion()` 安装一个
-模型分派：
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Route as 原生 /v1/completions
-    participant Native as OpenAIServingCompletion
-    participant Dispatch as RECIF handler
-    participant Search as recif_beam_search
-    participant Convert as 原生 response converter
-
-    Client->>Route: CompletionRequest
-    Route->>Native: create_completion()
-    alt architectures 包含 RecifForCausalLM
-        Native->>Dispatch: _create_recif_completion()
-        Dispatch->>Native: render_completion_request()
-        Dispatch->>Search: token IDs + n
-        Search-->>Dispatch: RequestOutput
-        Dispatch->>Convert: request_output_to_completion_response()
-        Convert-->>Client: CompletionResponse
-    else OneRec 或其他模型
-        Native->>Native: 原始 _create_completion()
-        Native-->>Client: 原有响应
-    end
-```
-
-这样可以复用 vLLM 的：
-
-- FastAPI 路由；
-- `CompletionRequest` 参数解析；
-- 模型名称校验；
-- request ID 和 metadata；
-- LoRA、trace headers、priority 和 data-parallel rank 获取；
-- `RequestOutput -> CompletionResponse` 转换；
-- usage 统计。
-
-### 8.2 在线请求约束
-
-当前 RECIF 在线请求要求：
-
-- `use_beam_search=true`；
-- `stream=false`；
-- `max_tokens=3`；
-- `echo=false`；
-- 暂不支持 completion logprobs 返回；
-- 每个 HTTP 请求只接受一个 token-ID prompt；
-- `n` 表示最终返回数量，不强制为 64。
-
-请求示例：
-
-```json
 {
-  "model": "/path/to/recif-checkpoint",
-  "prompt": [0, 1, 8194, 16387, 0],
-  "use_beam_search": true,
-  "n": 64,
-  "max_tokens": 3
+  "text": "",
+  "token_ids": [1915, 8558, 18612]
 }
-```
+由客户端调用：
 
-### 8.3 异步搜索编排
+generated_tokens_to_sid(choice["token_ids"])
+转换为最终 SID。
 
-`entrypoints/recif/serving_engine.py`：
+9.7 完整 RECIF E2E
+E2E 脚本接收原始 checkpoint 路径，在临时目录中自动转换权重，然后依次执行离线和在线验证：
 
-1. 校验 prompt 是否符合 `[0, sa, sb+8192, sc+16384] * N + [0]`。
-2. 调用模型的 `build_beam_search_steps(beam_width)`。
-3. 每层构造带 `allowed_token_ids` 的 `SamplingParams`。
-4. 复用现有在线 `_add_batch_step()` 向异步引擎发送请求。
-5. 复用公共 `apply_beam_search_step()` 做候选选择。
-6. 将三个生成 token 还原为 SID。
-7. 返回 vLLM 原生 `RequestOutput` 和 `CompletionOutput`。
+RECIF_MODEL_PATH=/path/to/original/checkpoint \
+  bash ./tests/system/run_recif_e2e.sh
+脚本执行顺序：
 
-在线和离线没有强行共享同步/异步引擎编排，但共享以下模型语义：
+校验原始三个文件
+  → 转换为临时 HF checkpoint
+  → 运行离线 beam search
+  → 验证离线64条结果
+  → 启动在线服务
+  → 请求 /v1/completions
+  → 从 choices[].token_ids 转换 SID
+  → 验证在线64条结果
+verify_recif_e2e.py 对前20个 SID 做集合和近似排名验证：允许少量相邻次序变化，但不允许主要结果集合发生变化。
 
-- `BeamSearchStep`；
-- RECIF 的三层搜索配置；
-- `apply_beam_search_step()`；
-- SID 编解码。
+10. CI 接入
+当前 GitHub Actions 使用 self-hosted runner，并从机器本地路径读取未公开的 RECIF checkpoint：
 
-## 9. 测试与 CI
-
-### 9.1 单元测试
-
-`tests/test_recif_model_support.py` 覆盖：
-
-- SID encode/decode round trip；
-- prefix 构造及三层 offset；
-- 在线 token prompt 格式校验；
-- RECIF 固定 `8, 8, 8` 分层策略；
-- OneRec 固定宽度回归；
-- completion handler 只对 RECIF 架构分派；
-- 本地检查点文件校验；
-- 模型 config 必要字段校验；
-- 三个 SID head 合并；
-- 缺失 head、错误 shape 和重复 lm_head 错误处理。
-
-`tests/test_shared_beam_step.py` 覆盖：
-
-- 多个父 Beam 的候选全局排序；
-- 父 Beam 动态 token 约束；
-- engine outputs 数量错误；
-- 缺少 logprobs 的错误处理。
-
-### 9.2 模型 E2E
-
-`tests/system/run_recif_e2e.sh` 执行：
-
-1. 检查模型目录与三个必要文件。
-2. 执行离线 RECIF Beam Search。
-3. 验证离线输出。
-4. 启动 tokenizer-free `vllm-gr serve`。
-5. 等待 `/health` 就绪。
-6. 调用原生 `/v1/completions`。
-7. 验证在线输出。
-8. 退出时停止服务并清理临时目录。
-
-`verify_recif_e2e.py` 的判定规则：
-
-- 必须返回 64 个 SID；
-- 前 20 个 SID 集合必须一致；
-- 每个预期 SID 的名次漂移不能超过 2；
-- 不使用浮点累计分数作为门禁判定，减少硬件数值差异导致的误报。
-
-### 9.3 CI 接入
-
-`.github/workflows/pre-commit.yml` 增加两个步骤：
-
-1. 运行 RECIF 与公共 Beam Step 单元测试。
-2. 使用 self-hosted Runner 上的固定模型目录执行离线和在线 E2E。
-
-当前门禁模型路径为：
-
-```text
 /data/datasets/recif_beam_search/checkpoint
-```
+workflow 中执行：
 
-工作流会先检查 `config.json`、`_model_rank0.pt` 和 `external_rank0.pt`，然后安装
-`requirements/recif.txt` 并执行系统测试。权重不进入 Git 仓库，也不需要在 PR 中
-配置 SSH 凭据。
+pytest tests/test_recif_model_support.py tests/test_shared_beam_step.py
 
-## 10. 代码结构
+RECIF_MODEL_PATH=/data/datasets/recif_beam_search/checkpoint \
+  bash ./tests/system/run_recif_e2e.sh
+模型不通过 GitHub Actions 网络下载，也不提交到仓库。权重只需要存在于执行该 job 的 self-hosted runner 上。
 
-代码按职责分为五部分：
+11. 当前设计结论
+当前实现最终形成了以下职责边界：
 
-| 模块 | 主要文件 | 职责 |
-| --- | --- | --- |
-| 离线入口 | `entrypoints/gr.py` | Beam 实例初始化、分批和多层搜索编排 |
-| 公共搜索 | `beam_search_config.py`、`beam_search_step.py` | 分层配置和单步候选选择 |
-| 模型策略 | `models/model_adapter.py`、`models/one_rec.py` | 隔离 OneRec/RECIF 离线差异 |
-| RECIF 模型 | `models/recif.py` | 权重转换、SID、prefix 和三层约束 |
-| RECIF 在线 | `entrypoints/recif/` | 原生 completion 分派及异步搜索 |
-| 测试门禁 | `tests/`、`.github/workflows/pre-commit.yml` | 单测、离线/在线 E2E 和 CI |
-
-原先 RECIF 专用的 `api_router.py` 和 `protocol.py` 已删除，在线请求统一复用 vLLM
-原生 `/v1/completions` 路由与协议。
-
-## 11. 文件变更说明
-
-| 文件 | 作用 |
-| --- | --- |
-| `vllm_gr/entrypoints/gr.py` | 将离线 Beam Search 改为 Adapter + 公共步骤主干 |
-| `vllm_gr/entrypoints/beam_search_config.py` | 新增公共模型枚举、步骤配置和输入状态 |
-| `vllm_gr/beam_search_step.py` | 新增模型无关的单步 Beam 转移 |
-| `vllm_gr/models/model_adapter.py` | 定义 OneRec/RECIF 离线适配边界 |
-| `vllm_gr/models/one_rec.py` | 承接原来位于 `gr.py` 的 OneRec 输入输出逻辑 |
-| `vllm_gr/models/recif.py` | RECIF 模型、权重转换、SID 和搜索策略 |
-| `vllm_gr/entrypoints/recif/completion_handler.py` | 原生 completion handler 内的 RECIF 分派 |
-| `vllm_gr/entrypoints/recif/serving_engine.py` | RECIF 异步在线 Beam Search |
-| `vllm_gr/entrypoints/recif/__init__.py` | 显式声明 RECIF package |
-| `vllm_gr/plugin.py` | 注册模型并安装在线 handler 分派 |
-| `examples/.../offline_recif_beam_search.py` | 离线调用示例 |
-| `requirements/recif.txt` | RECIF 依赖版本 |
-| `requirements/cuda.txt` | CUDA 安装链引入 RECIF 依赖 |
-| `README.md` | 说明本地检查点限制 |
-| `examples/.../README.md` | 离线与在线使用说明 |
-| `tests/test_recif_model_support.py` | RECIF 与 OneRec 回归单测 |
-| `tests/test_shared_beam_step.py` | 公共候选选择单测 |
-| `tests/system/run_recif_e2e.sh` | 离线/在线模型 E2E 编排 |
-| `tests/system/verify_recif_e2e.py` | SID 数量和排序验证 |
-| `.github/workflows/pre-commit.yml` | 将单测和模型 E2E 接入门禁 |
-
-## 12. 兼容性与限制
-
-- `beam_search_model` 默认仍是 `BeamSearchModel.ONE_REC`，现有离线调用不需要修改。
-- OneRec 的 Custom Attention、catalog、begin/end token 和在线 Beam Search 保持原路径。
-- RECIF 当前只支持本地检查点目录。
-- RECIF 当前固定三个 SID 层级，每层扩展数固定为 8。
-- RECIF 在线不支持 streaming、echo 和 completion logprobs。
-- RECIF 在线当前只支持单个 token-ID prompt，不支持一个请求内批量 prompts。
-- 在线与离线共享候选选择和模型分层配置，但分别保留异步和同步引擎编排，以避免
-  为追求形式统一而引入额外抽象。
-
-## 13. 最终效果
-
-改造后，公共离线 Beam Search 不再了解 RECIF 的 8192 词表分段，也不直接处理
-OneRec tokenizer；它只消费统一的 `PreparedBeamInputs` 和 `BeamSearchStep`。
-
-RECIF 的模型固有信息集中在模型模块中：
-
-```text
-层数 = 3
-每层扩展 = 8
-每层 allowed-token 范围 = 模型词表的对应 8192 区间
-```
-
-OneRec 与 RECIF 的关系最终变为：
-
-```mermaid
-flowchart TB
-    Shared[公共离线 Beam Search 主干]
-    OneRecPolicy[OneRec 输入 / 输出 / 固定宽度策略]
-    RecifPolicy[RECIF prefix / SID / 三层约束策略]
-    SharedStep[公共 apply_beam_search_step]
-    ExistingOnline[OneRec 原有在线候选处理]
-
-    OneRecPolicy --> Shared
-    RecifPolicy --> Shared
-    Shared --> SharedStep
-
-    OneRecOnline[OneRec 原在线 Beam Search]
-    RecifOnline[RECIF /v1/completions 异步编排]
-    OneRecOnline --> ExistingOnline
-    RecifOnline --> SharedStep
-```
-
-其中 OneRec 在线路径主要继续使用已有在线实现；RECIF 在线明确复用了公共单步转移。
-整体实现既复用了关键搜索逻辑，也保留了两个模型各自必要的输入、约束、引擎调用和
-输出差异。
+组件	负责内容	不负责内容
+RecifForCausalLM	Qwen3-MoE 执行类、模型配置校验	SID 编解码、运行时权重转换
+RECIF step builder	三层结构、8/8/8、allowed-token 范围	最终请求 beam width
+GRLLM.beam_search()	标准输入、实例管理、公共搜索编排	判断 history_sids、转换 SID
+apply_beam_search_step()	累计分数、全局剪枝、构造新 beam	模型专用输入语义
+CUSTOM backend	grouped request、fork、KV Cache 和 attention 优化	改变 beam-search 数学结果
+recif_utils.py	SID 与 token IDs 转换	模型执行和调度
+checkpoint converter	部署前权重格式转换	在线/离线请求处理
+因此，vllm-gr 的公共接口保持接近 vLLM：输入是文本或 token IDs，输出核心是 token IDs 和分数；RECIF 的模型结构由模型文件注册，业务 SID 语义由调用方处理。

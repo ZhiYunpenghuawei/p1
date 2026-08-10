@@ -1,4 +1,4 @@
-# [RFC][Task 2] 增量解码 Attention 计算路径设计
+# [RFC][Task 2] 增量解码 Beam Attention 计算路径：实现结果与接入说明
 
 - Parent RFC：#249
 - Related design：#248
@@ -6,425 +6,326 @@
 - 代码基线：`decode_graph@1a8320a`
 - 范围：增量 Beam Search 的 Attention 计算层
 - 日期：2026-08-10
-- 状态：分阶段实现中，生产路径默认未启用
+- 状态：Task 2 核心计算路径已实现，端到端启用等待 Task 3 接入
 
-## 1. 文档目的
+## 1. 结论
 
-Task 2 要解决的问题是：增量 Beam Search 每个 Step 只产生一组新的 Beam K/V，但当前 Legacy 路径会把 Beam Suffix 写入 Paged KV Cache，并在每一步通过 `extract_suffix_kv` 重新 Gather 完整历史。
+Task 2 已经在现有 `BeamAttention` 中增加一条显式的 Incremental 路径。该路径复用 Task 1 提供的 `BeamSearchSession`、每层 `BeamAttentionPool`、固定 Suffix Buffer 和 KV 算子，完成以下工作：
 
-Task 2 将增加一条显式 Incremental 路径：
+1. 为 Incremental 模式单独构造 Attention Metadata；
+2. 在 `BeamAttentionImpl.forward()` 中显式区分 Legacy 和 Incremental；
+3. 将当前层、当前 Step 的 K/V 写入该层的 Unshared KV Pool；
+4. 从 Paged KV Cache 计算 Shared Prefix Attention；
+5. 将 Pool 有效区整理到 FlashAttention 可读取的固定连续 Buffer；
+6. 计算 Unshared Suffix Attention；
+7. 使用 LSE Merge 合并 Prefix/Suffix 两段结果，直接写入调用方 `output`。
 
-1. 当前层、当前 Step 的 K/V 写入 Task 1 提供的固定地址 `BeamAttentionPool`；
-2. 共享 Prefix 继续从 Paged KV Cache 读取；
-3. 独立 Suffix 从当前层 Pool 的有效历史读取；
-4. Pool 有效区复制到预分配的连续 Suffix K/V Buffer；
-5. 分别执行 Prefix Attention 和 Suffix Attention；
-6. 使用 LSE Merge 合并两段 Attention；
-7. Legacy 路径保持不变，未支持场景在 Session 激活前 Gate 到 Legacy。
+Task 2 的核心不是 Beam TopK 或 KV 重排，而是把 Task 1 保存的 Unshared KV 历史转成 Attention 可以消费的计算路径。
 
-Task 2 不负责 Beam TopK、Parent 分组、KV 重排和 Session 生命周期推进。
+当前实现不自动启用。Task 3 需要负责创建 Session、发布 Incremental 元数据、准备每个 Beam 的单 Token 输入，并在 Parent 选择完成后推进 Session。
 
-## 2. 总体架构与任务边界
-
-```mermaid
-flowchart LR
-    S[Task 3<br/>Scheduler 与执行编排]
-    M[Task 2<br/>Metadata Builder]
-    F[Task 2<br/>BeamAttentionImpl.forward]
-    C[Task 2<br/>CUDA Incremental Cascade]
-    P[Task 1<br/>BeamAttentionPool]
-    SS[Task 1<br/>BeamSearchSession]
-    O[Task 1<br/>cache/select KV 算子]
-    D[Decode 算子<br/>TopK 与 Parent Group]
-
-    S -->|可序列化字段| M
-    S -->|Worker 本地 Session| SS
-    M -->|BeamAttentionMetadata| F
-    SS -->|pool_for_layer| P
-    F -->|cache_unshared_kv| O
-    O -->|写当前 Step| P
-    F -->|Pool 与固定 Buffer| C
-    C -->|Attention Output| F
-    D -->|Parent Mapping| S
-    S -->|prepare_next_step| SS
-    SS -->|select_unshared_kv| O
-```
-
-边界如下：
+## 2. 实现范围与任务边界
 
 | 模块 | 责任 |
 | --- | --- |
-| Task 1 Pool | 保存每个本地 Attention 层的 Unshared K/V 历史 |
-| Task 1 Session | 管理所有层 Pool、Step、Prefix 长度、固定 Suffix Buffer 和生命周期 |
-| Task 1 KV 算子 | 写入当前 Step、按照 Parent 重排所有层历史 |
-| Task 2 Metadata | 为 Prefix/Suffix Attention 构造长度、索引和 Block Table |
-| Task 2 Forward | 显式选择 Legacy/Incremental，定位当前层 Pool 并写入当前 K/V |
-| Task 2 CUDA Cascade | Pool-to-Buffer、Prefix FA、Suffix FA、LSE Merge |
-| Task 3 | Session 创建/结束、输入重映射、Step 校验、Parent 决策后的推进 |
-| Decode 算子 | 稳定 TopK、Parent 分组、最终序列选择 |
+| Task 1 `BeamAttentionPool` | 为每个本地 Attention 层保存固定地址的 Unshared K/V 历史 |
+| Task 1 `BeamSearchSession` | 管理所有层 Pool、当前 Step、Prefix 长度和固定 Suffix Buffer |
+| Task 1 KV Operators | 写入当前 Step，以及根据 Parent Mapping 重排所有层的历史 KV |
+| Task 2 Metadata Builder | 构造 Prefix/Suffix Attention 所需的索引、长度和 Block Table |
+| Task 2 Forward | 选择 Legacy/Incremental，找到当前层 Pool并写入当前 Step K/V |
+| Task 2 CUDA Backend | Pool-to-Buffer、Prefix FA、Suffix FA 和 LSE Merge |
+| Task 3 | Session 生命周期、输入重映射、模式开关、TopK 后的 Step 推进 |
 
-## 3. 当前代码状态
+Task 2 明确不负责：
 
-### 3.1 Task 1 已合入
+- Beam TopK 和 Parent 分组；
+- 调用 `select_unshared_kv()` 重排历史；
+- `begin_session()`、`prepare_next_step()`、`end_session()` 的调用时机；
+- Scheduler/ModelRunner 中的请求生命周期；
+- NPU、KV Sharing、量化 KV 的 Incremental 实现。
 
-当前上游已经包含：
-
-```text
-vllm_gr/v1/beam/beam_attention_pool.py
-vllm_gr/ops/cache_unshared_kv.py
-vllm_gr/ops/onerec_decode.py
-```
-
-其中：
-
-- `BeamAttentionPool` 提供固定地址 5-D K/V Storage；
-- `cache_unshared_kv_torch` 提供通用 xllm-ops ABI 的当前 Step 写入；
-- `beam_search_group` 执行稳定 TopK 后按 Parent 稳定分组；
-- `select_unshared_kv` 当前使用 `clone + gather + 写回`，保证覆盖安全；
-- `beam_search_rec_final_select` 执行最终稳定 TopK。
-
-### 3.2 Task 1 尚未合入
-
-当前代码还没有：
-
-```text
-vllm_gr/v1/beam/beam_search_session.py
-vllm_gr/v1/attention/backends/beam_kernels.py
-```
-
-Task 2 最终 Forward 接线依赖以下接口：
-
-```python
-class BeamSearchSession:
-    suffix_k_buf: torch.Tensor
-    suffix_v_buf: torch.Tensor
-
-    @property
-    def is_active(self) -> bool: ...
-
-    @property
-    def beam_width(self) -> int: ...
-
-    @property
-    def current_step(self) -> int: ...
-
-    @property
-    def prefix_len(self) -> int: ...
-
-    def pool_for_layer(self, layer_name: str) -> BeamAttentionPool: ...
-    def prepare_next_step(self, parent: torch.Tensor) -> None: ...
-```
-
-以及面向 Session 的 0-based facade：
-
-```python
-def cache_unshared_kv(
-    unshared_key: torch.Tensor,
-    unshared_value: torch.Tensor,
-    curr_key: torch.Tensor,
-    curr_value: torch.Tensor,
-    step: int,
-) -> None: ...
-```
-
-不能直接使用通用 `cache_unshared_kv_torch` 代替，因为通用算子使用 `block_table` 和设备上的 1-based `decode_step` Tensor，两者 ABI 不同。
-
-### 3.3 Task 2 当前工作区已完成的第一阶段
-
-当前 Task 2 工作区已经增加：
-
-- `BeamAttentionMetadata.is_incremental_decode`；
-- `incremental_beam_width`；
-- `incremental_suffix_kv_len`；
-- CUDA `_copy_pool_suffix_to_buffer`；
-- CUDA `cascade_attention_incremental`；
-- `BeamAttentionImpl.cascade_attention_incremental` 平台委托入口；
-- NPU Incremental 明确拒绝入口；
-- Pool 布局、容量失败原子性、Cascade 路由和平台委托测试。
-
-当前没有修改生产 `BeamAttentionImpl.forward()` 的分流，Feature 尚未接通。
-
-## 4. Legacy 与 Incremental 路径对比
+## 3. 当前实现的总体结构
 
 ```mermaid
-flowchart TB
-    Q[当前层 Q/K/V]
-    MODE{is_incremental_decode?}
+flowchart LR
+    T3[Task 3<br/>Scheduler / ModelRunner]
+    MB[Task 2<br/>Metadata Builder]
+    FW[Task 2<br/>BeamAttentionImpl.forward]
+    GPU[Task 2<br/>CUDA Incremental Cascade]
+    SESSION[Task 1<br/>BeamSearchSession]
+    POOL[Task 1<br/>Per-layer Pool]
+    OPS[Task 1<br/>KV Operators]
+    FA[Existing<br/>FlashAttention / LSE Merge]
 
-    subgraph LEGACY[Legacy 路径]
-        LC[reshape_and_cache<br/>当前 K/V 写 Paged Cache]
-        LP[Prefix Attention<br/>Paged Cache]
-        LG[extract_suffix_kv<br/>Paged Slot Gather]
-        LS[Suffix Attention]
-        LM[LSE Merge]
-    end
-
-    subgraph INC[Incremental 路径]
-        IP[pool_for_layer]
-        IC[cache_unshared_kv<br/>写当前 Step]
-        IA[Prefix Attention<br/>Paged Cache]
-        CP[Pool Active Region<br/>复制到固定 Buffer]
-        IS[Suffix Attention<br/>连续 Buffer]
-        IM[LSE Merge<br/>直接写 output]
-    end
-
-    Q --> MODE
-    MODE -->|False| LC --> LP --> LG --> LS --> LM
-    MODE -->|True| IP --> IC --> IA --> CP --> IS --> IM
+    T3 -->|beam_data + local session| MB
+    MB -->|BeamAttentionMetadata| FW
+    FW -->|pool_for_layer| SESSION
+    SESSION --> POOL
+    FW -->|cache_unshared_kv| OPS
+    OPS -->|write current step| POOL
+    FW --> GPU
+    POOL --> GPU
+    SESSION -->|fixed suffix buffers| GPU
+    GPU --> FA
+    GPU -->|output| FW
+    T3 -->|prepare_next_step| SESSION
+    SESSION -->|select_unshared_kv| OPS
 ```
 
-Incremental 路径消除的是：
+## 4. 关键类和函数关系
 
-- Paged Slot Mapping 驱动的不规则 Gather；
-- `extract_suffix_kv` 创建的临时连续 K/V Storage；
-- Incremental Merge 的额外 `torch.empty_like` Output。
+```mermaid
+classDiagram
+    class BeamSearchSession {
+        +bool is_active
+        +int beam_width
+        +int current_step
+        +int prefix_len
+        +Tensor suffix_k_buf
+        +Tensor suffix_v_buf
+        +begin_session(beam_width, prefix_len)
+        +pool_for_layer(layer_name) BeamAttentionPool
+        +prepare_next_step(beam_index, group_token_num)
+        +end_session()
+    }
 
-Incremental MVP 仍然会把 `W × L` 的 Pool 有效区复制到连续 Buffer。完全移除该复制需要后续自定义 CUDA/Triton Kernel 直接消费 5-D Pool，不属于本 RFC。
+    class BeamAttentionPool {
+        +Tensor unshared_key
+        +Tensor unshared_value
+        +active_key(beam_width) Tensor
+        +active_value(beam_width) Tensor
+    }
 
-## 5. 端到端调用流程
+    class BeamAttentionMetadataBuilder {
+        +build(... ) BeamAttentionMetadata
+        -_build_incremental_metadata(... ) BeamAttentionMetadata
+    }
+
+    class BeamAttentionMetadata {
+        +bool is_incremental_decode
+        +int incremental_beam_width
+        +int incremental_suffix_kv_len
+        +BeamSearchSession beam_session
+    }
+
+    class BeamAttentionImpl {
+        +forward(... ) Tensor
+        -_forward_incremental(... ) Tensor
+        +cascade_attention_incremental(... )
+    }
+
+    class CUDA_Backend {
+        +cascade_attention_incremental(... )
+        -_copy_pool_suffix_to_buffer(... )
+        -_fixup_single_token_gqa_lse(... )
+    }
+
+    BeamSearchSession "1" *-- "many" BeamAttentionPool
+    BeamAttentionMetadataBuilder --> BeamAttentionMetadata
+    BeamAttentionMetadata --> BeamSearchSession
+    BeamAttentionImpl --> BeamAttentionMetadata
+    BeamAttentionImpl --> BeamSearchSession
+    BeamAttentionImpl --> CUDA_Backend
+```
+
+接口层级说明：
+
+- `BeamAttentionImpl.forward()` 是现有生产调用入口，调用方不需要改成直接调用 GPU 函数；
+- `BeamAttentionImpl.cascade_attention_incremental()` 是 Attention 层与平台后端之间的委托接口；
+- GPU `cascade_attention_incremental()` 是 CUDA 平台计算接口；
+- `_forward_incremental()`、`_build_incremental_metadata()`、`_copy_pool_suffix_to_buffer()` 和 `_fixup_single_token_gqa_lse()` 都是内部函数；
+- `BeamSearchSession` 和 `cache_unshared_kv()` 由 Task 1 提供，Task 2 只消费它们。
+
+## 5. 当前新增和修改的代码
+
+### 5.1 `beam_attn_metadata.py`
+
+`BeamAttentionMetadata` 新增字段：
+
+```python
+is_incremental_decode: bool = False
+incremental_beam_width: int = 0
+incremental_suffix_kv_len: int = 0
+beam_session: BeamSearchSession | None = None
+```
+
+新增 `_build_incremental_metadata()`：
+
+- 只处理 CUDA Incremental 请求；
+- 当前只允许一个逻辑请求；
+- 要求每个 Beam 当前只有一个 Query Token；
+- 校验 Scheduler 元数据与 Session 的 Beam Width、Step 和 Prefix 长度一致；
+- 为 Prefix 构造共享 Paged Cache 的 FA Metadata；
+- 为 Suffix 构造 `W` 条独立序列的 FA Metadata；
+- 不生成 Legacy 使用的 `suffix_slot_mapping_out`；
+- 将 Worker 本地 `beam_session` 附加到返回的 Metadata。
+
+现有 `build()` 增加早期分流：
+
+```text
+存在 is_incremental_decode=True
+    -> _build_incremental_metadata()
+否则
+    -> 保持原来的 Legacy Builder 算法
+```
+
+### 5.2 `beam_attn.py`
+
+`BeamAttentionImpl.forward()` 增加显式模式分流：
+
+```python
+if attn_metadata.is_incremental_decode:
+    return self._forward_incremental(...)
+```
+
+新增 `_forward_incremental()`，负责：
+
+1. 校验平台、Session、dtype、device、Shape 和容量；
+2. 拒绝 NPU、KV Sharing 和量化 KV；
+3. 通过 `session.pool_for_layer(layer.layer_name)` 获取当前层 Pool；
+4. 获取当前层的 Active Beam View；
+5. 调用 Task 1 `cache_unshared_kv()` 写当前 Step；
+6. 调用当前平台的 `cascade_attention_incremental()`；
+7. 返回原调用方提供的 `output`。
+
+Incremental Forward 不调用：
+
+- `reshape_and_cache()` 写入 Paged Suffix；
+- `extract_suffix_kv()` 从 Paged Cache Gather Suffix；
+- `prepare_next_step()` 推进 Session。
+
+新增 `BeamAttentionImpl.cascade_attention_incremental()` 作为平台委托接口，使 Attention 主文件不直接依赖 CUDA 实现细节。
+
+### 5.3 `beam_attn_gpu.py`
+
+新增 `_copy_pool_suffix_to_buffer()`：
+
+- 从 Pool 读取 `[1, W, H, max_steps, D]`；
+- 截取当前有效区 `[W, H, L, D]`；
+- 调整为 `[W, L, H, D]`；
+- 复制到 Session 预分配的固定 Buffer；
+- 返回 FlashAttention 使用的 `[W * L, H, D]` View。
+
+新增 `_fixup_single_token_gqa_lse()`：
+
+- 统一处理 FA2 单 Token GQA 场景的 LSE 布局；
+- 供 Legacy Cascade 和 Incremental Cascade 复用；
+- 不改变原有 Legacy 数学逻辑。
+
+新增 `cascade_attention_incremental()`：
+
+1. 校验 Incremental Metadata；
+2. 使用 Paged KV Cache 执行 Prefix FlashAttention；
+3. 将当前层 Pool 的有效 Suffix 复制到固定 Buffer；
+4. 使用连续 Buffer 执行 Suffix FlashAttention；
+5. 修正需要兼容的 LSE 布局；
+6. 调用 `merge_attn_states()`，直接写入 `output[:W]`。
+
+### 5.4 `beam_attn_npu.py`
+
+增加同名 `cascade_attention_incremental()` 平台接口，但当前明确抛出 `NotImplementedError`。这可以防止 Incremental 请求错误进入 NPU Legacy 路径。
+
+### 5.5 测试
+
+当前新增或修改的测试覆盖：
+
+- Pool 到固定 Buffer 的布局和 FP16/BF16；
+- Buffer 容量不足时在写入前失败；
+- Incremental Metadata 的关键长度和索引；
+- CUDA Cascade 的 Prefix/Suffix 路由和输出写入；
+- `BeamAttentionImpl` 平台委托；
+- Forward 写入当前层 Pool；
+- Incremental Forward 不调用 Paged `reshape_and_cache()`。
+
+仍需在具备项目 GPU 依赖的环境中完成数值等价、CUDA Graph、分配和完整 Legacy 回归测试。
+
+## 6. 单个 Step 的真实调用流程
 
 ```mermaid
 sequenceDiagram
-    participant E as EngineCore/Scheduler
-    participant R as ModelRunner(Task 3)
-    participant B as MetadataBuilder(Task 2)
-    participant A as BeamAttentionImpl(Task 2)
-    participant P as BeamAttentionPool(Task 1)
-    participant G as CUDA Backend(Task 2)
-    participant D as Beam Decode Ops
-    participant S as BeamSearchSession(Task 1)
+    participant T3 as Task 3 / ModelRunner
+    participant MB as MetadataBuilder
+    participant F as BeamAttentionImpl.forward
+    participant S as BeamSearchSession
+    participant P as Current-layer Pool
+    participant O as cache_unshared_kv
+    participant G as CUDA Backend
+    participant FA as FlashAttention
 
-    E->>R: scheduler_output + beam_data
-    R->>S: begin_session(W, prefix_len)
-    R->>R: 发布 BEAM_DATA_VAR<br/>含本地 beam_session
-    R->>B: build(common_attn_metadata)
-    B->>B: 校验 incremental metadata
-    B-->>A: BeamAttentionMetadata
+    T3->>MB: common metadata + beam_data + beam_session
+    MB->>MB: _build_incremental_metadata()
+    MB-->>F: BeamAttentionMetadata
 
     loop 每个本地 Attention 层
-        A->>S: pool_for_layer(layer.layer_name)
-        S-->>A: 当前层 Pool
-        A->>P: cache_unshared_kv(..., current_step)
-        A->>G: cascade_attention_incremental(...)
-        G->>G: Prefix Attention
-        G->>G: Pool-to-Suffix-Buffer
-        G->>G: Suffix Attention
-        G->>G: LSE Merge
-        G-->>A: 写入 output
+        F->>F: _forward_incremental()
+        F->>S: pool_for_layer(layer_name)
+        S-->>F: 当前层 Pool
+        F->>O: 当前 Step K/V + active Pool
+        O->>P: 写 Pool[..., current_step, :]
+        F->>G: cascade_attention_incremental(...)
+        G->>FA: Prefix Attention / Paged Cache
+        G->>G: Pool Active Region -> Fixed Buffer
+        G->>FA: Suffix Attention / Continuous Buffer
+        G->>FA: LSE Merge
+        G-->>F: output 已写入
     end
 
-    R->>D: Beam TopK / Group
-    D-->>R: parent mapping
-    alt 还有下一次 Forward
-        R->>S: prepare_next_step(parent)
-        S->>P: select_unshared_kv 所有层
-        S->>S: current_step += 1
-    else 最终 Step 或提前结束
-        R->>S: end_session()
-    end
+    Note over T3,S: 所有层完成后，Task 3 才能根据 Parent Mapping 推进 Session
 ```
 
-关键约束：
-
-- `prepare_next_step(parent)` 必须发生在所有 Attention 层完成之后；
-- 单个 Attention 层不能推进 Session；
-- 最终 Step 不需要重排，直接 `end_session()`；
-- Session/Tensor 引用只能存在于 Worker 本地 Context，不能跨 Scheduler 进程序列化。
-
-## 6. Metadata Builder 调用流程
-
-### 6.1 模式分类
-
-```mermaid
-flowchart TD
-    BUILD[BeamAttentionMetadataBuilder.build]
-    READ[读取 BEAM_DATA_VAR]
-    HAS{存在 is_incremental_decode=True?}
-    COUNT{是否恰好一个逻辑请求?}
-    MIX{是否混入普通或 Legacy 请求?}
-    SESSION{Session 存在且 Active?}
-    VALIDATE[校验 W / Step / Prefix / Capacity]
-    INCBUILD[_build_incremental_metadata]
-    LEGACY[_segment_requests<br/>_build_beam_mappings<br/>_create_beam_tensors]
-    ERROR[抛出明确异常]
-
-    BUILD --> READ --> HAS
-    HAS -->|否| LEGACY
-    HAS -->|是| COUNT
-    COUNT -->|否| ERROR
-    COUNT -->|是| MIX
-    MIX -->|是| ERROR
-    MIX -->|否| SESSION
-    SESSION -->|否| ERROR
-    SESSION -->|是| VALIDATE --> INCBUILD
-```
-
-Legacy Builder 的现有函数和算法保持不变。Incremental 分支使用独立函数，避免把两套不同的 Beam 几何规则塞入 `_build_beam_mappings()`。
-
-### 6.2 Incremental Metadata 数值
-
-设：
-
-```text
-W = session.beam_width
-P = session.prefix_len
-t = session.current_step
-L = t + 1
-```
-
-每条 Beam 当前只有一个 Query Token。
-
-Prefix 是一个共享 Group：
-
-```text
-prefix_indices               = [0, 1, ..., W-1]
-prefix_seqlens_q_cpu         = [W]
-prefix_cu_seqlens_q_device   = [0, W]
-prefix_seqlens_kv            = [P]
-prefix_max_q_len             = W
-prefix_max_seq_len           = P
-```
-
-Suffix 是 W 条独立序列：
-
-```text
-suffix_seqlens_q_cpu         = [1, 1, ..., 1]
-suffix_cu_seqlens_q_device   = [0, 1, 2, ..., W]
-suffix_seqlens_kv_cpu        = [L, L, ..., L]
-suffix_cu_seqlens_k_device   = [0, L, 2L, ..., W*L]
-suffix_max_q_len             = 1
-suffix_max_seq_len           = L
-suffix_total_tokens          = W * L
-suffix_slot_mapping_out      = None
-```
-
-示例：
-
-```text
-W = 4, P = 17, current_step = 1, L = 2
-
-Prefix cu_q = [0, 4]
-Suffix cu_q = [0, 1, 2, 3, 4]
-Suffix cu_k = [0, 2, 4, 6, 8]
-Suffix total tokens = 8
-```
-
-## 7. 单层 Forward 调用流程
-
-```mermaid
-flowchart TD
-    FW[BeamAttentionImpl.forward]
-    NONE{attn_metadata is None?}
-    MODE{is_incremental_decode?}
-    LEGACY[执行现有 Legacy Forward]
-    PRECHECK[完整预校验<br/>不修改任何 Pool]
-    LAYER[session.pool_for_layer<br/>layer.layer_name]
-    CACHE[cache_unshared_kv<br/>写 Pool 当前 Step]
-    CASCADE[cascade_attention_incremental]
-    RETURN[返回调用方 output]
-    FAIL[快速失败<br/>禁止中途回退 Legacy]
-
-    FW --> NONE
-    NONE -->|是| RETURN
-    NONE -->|否| MODE
-    MODE -->|否| LEGACY --> RETURN
-    MODE -->|是| PRECHECK
-    PRECHECK -->|失败| FAIL
-    PRECHECK -->|通过| LAYER --> CACHE --> CASCADE --> RETURN
-```
-
-Incremental Forward 在写 Pool 前必须完成：
-
-- CUDA 平台校验；
-- Session 存在且 Active；
-- `key` / `value` 非空；
-- KV Sharing 未启用；
-- 非 FP8/量化 KV；
-- Metadata Step 与 Session Step 一致；
-- Beam Width、Prefix、dtype、device 一致；
-- Pool 和 Buffer 容量足够；
-- `layer_name` 能唯一找到 Pool；
-- 当前有效 Token 数等于 W。
-
-如果校验失败，Pool 必须保持不变。
-
-## 8. CUDA Incremental Cascade 内部流程
+## 7. CUDA Cascade 内部数据流
 
 ```mermaid
 flowchart TD
     ENTRY[cascade_attention_incremental]
-    CHECK[校验 Incremental Metadata]
-    Q[beam_query = query 前 W 行]
-    PREFIX[flash_attn_varlen_func<br/>Paged Prefix / causal=False]
+    CHECK[校验 W / L / Metadata / Buffer]
+    QUERY[beam_query = query 前 W 行]
+    PREFIX[Prefix FlashAttention<br/>K/V 来自 Paged Cache<br/>causal=False]
     COPY[_copy_pool_suffix_to_buffer]
-    SRC[Pool Source View<br/>W,H,L,D]
-    DST[Fixed Buffer View<br/>W,L,H,D]
-    SUFFIX[flash_attn_varlen_func<br/>Contiguous Suffix / causal=True]
-    FIX[FA2 单 Token GQA<br/>LSE Layout 修正]
+    SUFFIX[Suffix FlashAttention<br/>K/V 来自连续 Buffer<br/>causal=True]
+    FIX[_fixup_single_token_gqa_lse]
     MERGE[merge_attn_states<br/>直接写 output 前 W 行]
 
-    ENTRY --> CHECK --> Q --> PREFIX --> COPY
-    SRC -->|permute View| COPY
-    COPY -->|copy_| DST --> SUFFIX --> FIX --> MERGE
+    ENTRY --> CHECK --> QUERY --> PREFIX --> COPY --> SUFFIX --> FIX --> MERGE
 ```
 
-函数调用关系：
+Prefix 和 Suffix 的含义：
+
+- Prefix KV：所有 Beam 共享的 Prompt/Prefix，继续保存在原有 Paged KV Cache；
+- Suffix KV：Beam Search 开始后每条 Beam 独立产生的 KV，保存在 Task 1 的 Pool；
+- Prefix/Suffix 分别计算后不能直接相加，必须根据两侧 LSE 重新计算全局 Softmax 权重，再做加权合并；
+- 合并结果在数学上等价于将 Prefix KV 和 Suffix KV 拼接后执行一次完整 Attention。
+
+## 8. Pool 到 FlashAttention Buffer 的布局
+
+Task 1 Pool 的固定 Storage：
 
 ```text
-cascade_attention_incremental
-    ├── flash_attn_varlen_func                 # Prefix
-    ├── _copy_pool_suffix_to_buffer
-    │     ├── source.permute(...)              # 仅 View
-    │     └── target.view(...).copy_(source)   # 写固定 Buffer
-    ├── flash_attn_varlen_func                 # Suffix
-    ├── _fixup_single_token_gqa_lse
-    └── merge_attn_states
+[1, max_beams, kv_heads, max_decode_steps, head_dim]
 ```
 
-## 9. Pool 与 Suffix Buffer 布局
-
-Task 1 Pool：
+当前 Step 为 `t` 时：
 
 ```text
-[1, max_beams, kv_heads, max_steps, head_dim]
+W = session.beam_width
+L = t + 1
+有效区 = pool[0, :W, :, :L, :]
 ```
 
-当前有效区：
-
-```text
-[0, :W, :, :L, :]
-```
-
-逻辑源布局：
-
-```text
-[W, H, L, D]
-```
-
-通过 `permute(0, 2, 1, 3)` 得到 View：
-
-```text
-[W, L, H, D]
-```
-
-复制到固定 Buffer 后 Flatten：
-
-```text
-[W * L, H, D]
-```
+布局转换：
 
 ```mermaid
 flowchart LR
-    POOL[Pool<br/>1,W,H,maxL,D]
+    POOL[Pool Storage<br/>1,maxW,H,maxL,D]
     ACTIVE[Active Slice<br/>W,H,L,D]
-    VIEW[Permute View<br/>W,L,H,D]
+    PERMUTE[Permute View<br/>W,L,H,D]
     BUFFER[Fixed Buffer<br/>W,L,H,D]
-    TND[FlashAttention TND<br/>W*L,H,D]
+    TND[FA Input View<br/>W*L,H,D]
 
-    POOL -->|slice| ACTIVE -->|permute| VIEW -->|copy_| BUFFER -->|view| TND
+    POOL -->|slice| ACTIVE -->|permute| PERMUTE -->|copy_| BUFFER -->|view| TND
 ```
 
-Token 顺序固定为：
+Buffer 中的顺序固定为：
 
 ```text
 beam 0 step 0
@@ -435,250 +336,240 @@ beam 1 step 1
 ...
 ```
 
-即：
+对应关系：
 
 ```python
-buffer[(beam * L) + step, head, dim]
+buffer[beam * L + step, head, dim]
     == pool[0, beam, head, step, dim]
 ```
 
-## 10. 跨 Step 状态推进
+当前实现仍然存在一次 `W * L` 的 Pool-to-Buffer 复制，但目标 Buffer 在 Session 创建时已经分配，地址固定；Task 2 不为每次 Cascade 新建一整块 Suffix K/V Storage。
+
+## 9. Metadata 结果
+
+定义：
+
+```text
+W = session.beam_width
+P = session.prefix_len
+t = session.current_step
+L = t + 1
+```
+
+Prefix 是一个共享序列，一次处理 `W` 个 Query：
+
+```text
+prefix_indices             = [0, 1, ..., W-1]
+prefix_cu_seqlens_q        = [0, W]
+prefix_seqlens_kv          = [P]
+prefix_max_q_len           = W
+prefix_max_seq_len         = P
+```
+
+Suffix 是 `W` 条独立序列，每条一个 Query、`L` 个 KV：
+
+```text
+suffix_cu_seqlens_q        = [0, 1, 2, ..., W]
+suffix_cu_seqlens_k        = [0, L, 2L, ..., W*L]
+suffix_seqlens_kv          = [L, L, ..., L]
+suffix_max_q_len           = 1
+suffix_max_seq_len         = L
+suffix_total_tokens        = W * L
+suffix_slot_mapping_out    = None
+```
+
+## 10. Task 3 如何接入
+
+Task 3 不需要直接调用 `_forward_incremental()` 或 GPU Backend。它只需要准备 Session 和 Context，然后继续走现有模型 Forward。
+
+### 10.1 请求开始
+
+在 Worker 本地为请求准备 `BeamSearchSession`，并调用：
+
+```python
+session.begin_session(beam_width=W, prefix_len=P)
+```
+
+Session 必须与执行模型的 Worker 位于同一进程和设备，不能把 Tensor/Session 对象跨 Scheduler 进程序列化。
+
+### 10.2 每次 Forward 前发布 Context
+
+当前 Builder 从 `BEAM_DATA_VAR` 读取以下结构：
+
+```python
+{
+    "beam_data": {
+        req_id: {
+            "is_incremental_decode": True,
+            "beam_width": W,
+            "decode_step": session.current_step,
+            "prefix_len": P,
+            "cache_len": P,
+        }
+    },
+    "req_ids": [req_id],
+    "beam_session": session,
+}
+```
+
+其中：
+
+- `is_incremental_decode=True` 是进入 Task 2 分支的显式开关；
+- `decode_step` 是 Host 侧 0-based Step，必须等于 `session.current_step`；
+- `cache_len == prefix_len`，表示 Paged KV Cache 只提供 Shared Prefix；
+- `beam_session` 是 Worker 本地对象；
+- 当前 `CommonAttentionMetadata` 必须呈现一个逻辑请求、连续 `W` 行 Query，即 `query_start_loc_cpu == [0, W]`；
+- 每条 Beam 每次 Forward 只允许一个新 Token。
+
+### 10.3 正常执行模型
+
+Task 3 继续调用现有模型执行入口。Metadata Builder 和 `BeamAttentionImpl.forward()` 会根据 `is_incremental_decode` 自动进入新增路径。
+
+不要直接调用：
+
+```python
+_build_incremental_metadata(...)
+_forward_incremental(...)
+_copy_pool_suffix_to_buffer(...)
+beam_attn_gpu.cascade_attention_incremental(...)
+```
+
+### 10.4 当前 Step 完成后
+
+所有 Attention 层 Forward 完成，并且 Decode 算子得到新的 Parent Mapping 后，Task 3 调用：
+
+```python
+session.prepare_next_step(beam_index, group_token_num)
+```
+
+该调用会：
+
+1. 通过 Task 1 `select_unshared_kv()` 重排所有层的历史；
+2. 更新设备侧 1-based `decode_step_buf`；
+3. 将 Host 侧 `current_step` 推进到下一步。
+
+注意：必须在所有 Attention 层都完成当前 Step 后调用，不能在单个 Attention 层内部推进 Session。
+
+### 10.5 请求结束
+
+最后一个 Step 或提前结束时调用：
+
+```python
+session.end_session()
+```
+
+最后一个 Step 不需要为了下一轮再调用 `prepare_next_step()`。
+
+### 10.6 Task 3 生命周期流程
 
 ```mermaid
 stateDiagram-v2
     [*] --> Inactive
     Inactive --> Step0: begin_session(W, P)
-    Step0 --> Step1: prepare_next_step(parent)<br/>select history + advance
-    Step1 --> StepN: prepare_next_step(parent)<br/>select history + advance
-    StepN --> Inactive: end_session()
-    Step0 --> Inactive: early stop / final step
-    Step1 --> Inactive: early stop / final step
+    Step0 --> Forward0: 发布 Context + 模型 Forward
+    Forward0 --> Step1: TopK/Group + prepare_next_step
+    Step1 --> ForwardN: 发布新 Step Context + 模型 Forward
+    ForwardN --> StepN: TopK/Group + prepare_next_step
+    Forward0 --> Inactive: final/early stop + end_session
+    ForwardN --> Inactive: final/early stop + end_session
 ```
 
-在 Step `t`：
-
-```text
-Forward 写入：Pool[..., t, :]
-Attention 读取：Pool[..., :t+1, :]
-Forward 后重排：只处理 [0, t]
-推进后：current_step = t + 1
-```
-
-Parent 定义：
-
-```text
-parent[dst] = src
-```
-
-例如：
-
-```text
-parent = [3, 1, 1, 1]
-```
-
-表示新 Beam 0 继承旧 Beam 3，其余三个新 Beam 继承旧 Beam 1。该重排属于 Task 1，不属于 Task 2。
-
-## 11. 关键函数清单
-
-### 11.1 当前已经存在
-
-| 文件 | 函数/类型 | 当前作用 |
-| --- | --- | --- |
-| `beam_attention_pool.py` | `BeamAttentionPool` | 每层固定地址 Pool |
-| `cache_unshared_kv.py` | `cache_unshared_kv_torch` | 通用 1-based、Block Table KV 写入 |
-| `onerec_decode.py` | `beam_search_group` | 稳定 TopK 与 Parent 分组 |
-| `onerec_decode.py` | `select_unshared_kv` | 快照式 KV 重排 |
-| `beam_attn_metadata.py` | `BeamAttentionMetadataBuilder.build` | 当前 Legacy Metadata 构造入口 |
-| `beam_attn.py` | `BeamAttentionImpl.forward` | 当前生产 Attention Forward |
-| `beam_attn_gpu.py` | `cascade_attention` | 当前 CUDA Legacy Cascade |
-| `beam_attn_triton.py` | `extract_suffix_kv` | 当前 Paged Suffix Gather |
-
-### 11.2 Task 2 当前工作区新增
-
-| 文件 | 函数/字段 | 作用 |
-| --- | --- | --- |
-| `beam_attn_metadata.py` | `is_incremental_decode` | 显式模式开关 |
-| `beam_attn_metadata.py` | `incremental_beam_width` | Active Beam 数 |
-| `beam_attn_metadata.py` | `incremental_suffix_kv_len` | 当前有效 Suffix 长度 |
-| `beam_attn_gpu.py` | `_copy_pool_suffix_to_buffer` | Pool 到固定 TND Buffer |
-| `beam_attn_gpu.py` | `_fixup_single_token_gqa_lse` | 复用 FA2/GQA LSE 修正 |
-| `beam_attn_gpu.py` | `cascade_attention_incremental` | CUDA Prefix/Suffix/Merge |
-| `beam_attn.py` | `cascade_attention_incremental` | 平台委托入口 |
-| `beam_attn_npu.py` | `cascade_attention_incremental` | NPU 显式拒绝 |
-
-### 11.3 后续待实现
-
-| 所属 | 函数/类型 | 作用 |
-| --- | --- | --- |
-| Task 1 | `BeamSearchSession` | 管理所有层 Pool 和状态 |
-| Task 1 | Session `cache_unshared_kv` facade | 0-based Host Step 写入 |
-| Task 1 | `prepare_next_step(parent)` | 所有层重排后推进 Step |
-| Task 2 | `_build_incremental_metadata` | 独立 Incremental Metadata 构造 |
-| Task 2 | `_validate_incremental_forward` | 写 Pool 前完整校验 |
-| Task 2 | `_forward_incremental` | 生产 Forward 增量分支 |
-| Task 3 | Session Context 发布 | 将本地 Session 提供给 Builder/Forward |
-
-## 12. PR 拆分与依赖
+## 11. Legacy 与 Incremental 的关系
 
 ```mermaid
-flowchart LR
-    T1P1[Task 1 PR 1<br/>BeamAttentionPool]
-    T1P2[Task 1 PR 2<br/>KV Operators/Facade]
-    T1P3[Task 1 PR 3<br/>BeamSearchSession]
-    T2P1[Task 2 PR 1<br/>Incremental Metadata]
-    T2P2[Task 2 PR 2<br/>CUDA Pool Cascade]
-    T2P3[Task 2 PR 3<br/>Forward Integration]
-    T3[Task 3<br/>Session Orchestration]
+flowchart TD
+    F[BeamAttentionImpl.forward]
+    MODE{is_incremental_decode?}
+    LEGACY[Legacy<br/>reshape_and_cache<br/>cascade_attention<br/>extract_suffix_kv]
+    INC[Incremental<br/>cache_unshared_kv<br/>Pool-to-Buffer<br/>incremental cascade]
 
-    T1P1 --> T1P3
-    T1P2 --> T1P3
-    T1P1 --> T2P2
-    T2P1 --> T2P3
-    T2P2 --> T2P3
-    T1P2 --> T2P3
-    T1P3 --> T2P3
-    T3 --> T2P3
+    F --> MODE
+    MODE -->|False| LEGACY
+    MODE -->|True| INC
 ```
 
-### Task 2 PR 1：Incremental Metadata
+Legacy Builder 和 Legacy Forward 的主要算法保持不变。Task 3 必须在 Session 激活前完成 Feature Gate：不支持的请求继续使用 Legacy。
 
-- 新增独立 Incremental Builder；
-- 校验单请求、单 Token-per-Beam、Step、Prefix 和容量；
-- 构造 Prefix/Suffix `cu_seqlens`；
-- 不生成 `suffix_slot_mapping_out`；
-- Legacy Builder 保持不变。
+一旦 Incremental Session 已激活，发生契约错误时必须快速失败，不能在执行中静默回退 Legacy，因为 Paged KV Cache 中没有完整的 Beam Suffix 历史。
 
-### Task 2 PR 2：CUDA Pool Cascade
+## 12. MVP 限制
 
-- Pool-to-Buffer；
-- Prefix FA；
-- Suffix FA；
-- LSE Merge；
-- FA2/GQA 修正；
-- CUDA 等价和分配测试。
-
-当前工作区的第一阶段代码主要属于这个 PR。
-
-### Task 2 PR 3：Forward Integration
-
-- `BeamAttentionImpl.forward` 显式分流；
-- `pool_for_layer(layer.layer_name)`；
-- 调用 Task 1 facade 写当前 Step；
-- 消费 Task 3 本地 Session Context；
-- Unsupported Gate；
-- 多层、多 Step 联调。
-
-## 13. MVP Gate
-
-首版只支持：
+当前 Incremental 路径只支持：
 
 - CUDA；
-- `max_batch = 1`；
-- 一个 Active Session；
-- 每 Beam 每次 Forward 一个 Token；
+- 一个逻辑请求和一个 Active Session；
+- 每个 Beam 每次 Forward 一个 Query Token；
 - FP16/BF16；
 - 非量化 Paged Prefix Cache；
-- 固定 Beam Width；
-- 固定最大 Decode Step；
+- 固定 Beam Width 和最大 Decode Step；
+- 非空 Shared Prefix；
 - 单 Stream 顺序执行。
 
-以下情况在 Session 激活前进入 Legacy：
+以下情况必须在激活 Session 前 Gate 到 Legacy：
 
-- NPU Incremental；
-- FP8/量化 KV；
+- NPU；
+- FP8 或其他量化 KV；
 - KV Sharing；
-- 多请求混批；
-- 多 Active Session；
-- Regrow/Recombination；
-- 超出 Pool 容量；
-- CUDA Graph Capture/Replay；
-- 多 Stream 共享一个 Suffix Buffer。
+- 多请求混批或多个 Active Session；
+- Regrow、Recombination 或动态 Beam Width；
+- 超出 Pool/Buffer 容量；
+- 多 Stream 共享同一组固定 Buffer。
 
-已经进入 Active Incremental Session 后发生契约错误时，必须快速失败，不能静默切回 Legacy，因为 Paged Cache 中没有完整的 Beam Suffix。
+## 13. 当前对外契约总结
 
-## 14. 测试计划
+普通模型调用方继续使用现有接口：
 
-### Metadata
-
-- W 为 1、普通值和最大值；
-- Step 为 0 和最大合法 Step；
-- Prefix 跨一个或多个 Block；
-- 精确验证 Prefix/Suffix 长度和 `cu_seqlens`；
-- Session 缺失、Step/W/Prefix 不一致；
-- Incremental 混批拒绝；
-- Legacy Metadata 逐字段回归。
-
-### Pool-to-Buffer
-
-构造：
-
-```text
-pool[b,h,t,d] = encode(b,h,t,d)
+```python
+BeamAttentionImpl.forward(...)
 ```
 
-验证：
+Task 3 需要使用 Task 1 的生命周期接口：
 
-```text
-buffer[b*L+t,h,d] == pool[0,b,h,t,d]
+```python
+session.begin_session(W, P)
+session.prepare_next_step(beam_index, group_token_num)
+session.end_session()
 ```
 
-同时验证 Inactive Beam、Future Step 不进入有效区，Buffer 地址不变，容量错误发生在写入前。
+Task 3 需要向 Task 2 提供：
 
-### CUDA Cascade
+- `is_incremental_decode`；
+- `beam_width`；
+- 0-based `decode_step`；
+- `prefix_len` 和 `cache_len`；
+- Worker 本地 `beam_session`；
+- 一个逻辑请求、连续 `W` 行、每 Beam 一个 Token 的 Query/K/V。
 
-比较：
+Task 2 向 Task 3 保证：
 
-```text
-Legacy:      Paged Cache + extract_suffix_kv + Legacy Cascade
-Incremental: Pool + Fixed Buffer + Incremental Cascade
-```
+- 每个 Attention 层将当前 Step K/V 写入正确的层 Pool；
+- Prefix 从 Paged KV Cache 读取；
+- Suffix 从当前层 Pool 读取；
+- Incremental 路径不调用 `extract_suffix_kv()`；
+- Prefix/Suffix 通过 LSE 得到等价的完整 Attention 输出；
+- Task 2 不执行 TopK、Parent 重排或 Session Step 推进；
+- Legacy 请求仍走原有路径。
 
-逐层、逐 Step 比较：
+## 14. 完成状态与后续验证
 
-- Prefix output/LSE；
-- Suffix output/LSE；
-- Merge Output；
-- Parent 重排后的下一 Step 输出。
+当前代码已经完成：
 
-### Forward
+- 独立 Incremental Metadata Builder；
+- `BeamAttentionImpl.forward()` 显式分流；
+- 当前层 Pool 查找与当前 Step K/V 写入；
+- CUDA Pool-to-Buffer；
+- Prefix FA、Suffix FA 和 LSE Merge；
+- 平台委托接口及 NPU 明确拒绝；
+- 第一阶段 Metadata、Buffer、Cascade 和 Forward 单元测试。
 
-- Legacy 仍调用 `reshape_and_cache + cascade_attention`；
-- Incremental 不写 Paged Suffix；
-- 每层调用一次 `cache_unshared_kv`；
-- 使用 canonical `layer_name`；
-- Step 使用 Host `int`，不调用 `.item()`；
-- Task 2 不推进 Session；
-- 失败前 Pool 保持不变。
+端到端完成仍需要：
 
-## 15. 完成标准
+- Task 3 创建、发布和销毁 Session；
+- Task 3 完成增量输入行布局；
+- Task 3 在 TopK/Group 后调用 `prepare_next_step()`；
+- 多层、多 Step 联调；
+- CUDA FP16/BF16 与 Legacy Baseline 数值等价测试；
+- CUDA Graph Capture/Replay 和无额外分配测试；
+- CUDA/NPU Legacy 回归和性能测试。
 
-Task 2 完成需要满足：
-
-- Incremental Metadata Builder 完成；
-- 生产 Forward 显式分流完成；
-- 当前层 K/V 正确写入当前层 Pool；
-- Prefix 从 Paged Cache 读取；
-- Suffix 从 Pool 有效历史读取；
-- Incremental 路径不调用 `extract_suffix_kv`；
-- Pool-to-Buffer 不产生新的 K/V Storage；
-- Merge 直接写调用方 Output；
-- CUDA FP16/BF16 与 Legacy Baseline 等价；
-- Legacy CUDA/NPU/FP8/KV-Sharing 路径不变；
-- Task 2 不执行 TopK、Parent 分组、KV 重排或 Step 推进；
-- Task 1/Task 3 多层、多 Step 联调通过；
-- Feature Gate 默认关闭。
-
-## 16. 后续工作
-
-以下内容不属于本 RFC MVP：
-
-- CUDA Graph；
-- 多 Session 和 `max_batch > 1`；
-- Incremental 与普通请求 Continuous Batching；
-- NPU Incremental Cascade；
-- FP8 Pool；
-- KV Sharing；
-- 多 Stream Buffer 生命周期；
-- 无缓冲区 Parent 原地重排优化；
-- 直接消费 5-D Pool 的 CUDA/Triton Kernel；
-- Regrow、Recombination 和可变 Beam Width。
+后续优化项包括直接消费 5-D Pool 的 CUDA/Triton Kernel，以消除 Pool-to-Buffer 复制；该优化不属于当前 MVP。

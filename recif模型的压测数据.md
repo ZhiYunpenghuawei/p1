@@ -1,3 +1,46 @@
+recif 模型压测结果分析
+一、目的
+对 recif 模型在两种配置下的压测结果进行整理和分析（有 custom 优化 vs 没有 custom 优化），给出结论与优化建议。原始日志附在文档末尾。
+
+二、数据来源
+文件：recif模型的压测数据.txt
+仓库路径：/ZhiYunpenghuawei/p1/blob/main/recif%E6%A8%A1%E5%9E%8B%E7%9A%84%E5%8E%8B%E6%B5%8B%E6%95%B0%E6%8D%AE.txt
+（原始文本已完整保留在文末）
+三、关键指标汇总
+启用 custom 优化（第一段）
+Model load time : 33103.0 ms
+Avg latency : 38.70 ms
+Min latency : 34.59 ms
+Max latency : 46.37 ms
+P50 latency : 38.11 ms
+P95 latency : 45.52 ms
+P99 latency : 46.37 ms
+Std dev : 3.04 ms
+未启用 custom 优化（第二段）
+Model load time : 63331.8 ms
+Avg latency : 348.95 ms
+Min latency : 248.76 ms
+Max latency : 1060.37 ms
+P50 latency : 343.82 ms
+P95 latency : 359.03 ms
+P99 latency : 1060.37 ms
+Std dev : 110.98 ms
+四、观察与说明
+warmup 阶段（两次日志中）输出一致：top1_sid=5154174410510，logprob 大约 -2.95 — 表示模型预测结果在各次运行间稳定。
+启用 custom 优化时：
+平均延迟约 38.7 ms，延迟分布集中（Std dev = 3.04 ms），P99 仅 46.37 ms，说明延迟稳定且延迟非常低。
+模型加载时间约 33.1 s。
+未启用 custom 优化时：
+平均延迟约 349 ms，延迟波动大（Std dev = 110.98 ms），存在明显异常点（例如 iter 7 = 1060.37 ms，iter 41 = 517.91 ms），导致 P99 飙高到 1060 ms。
+模型加载时间约 63.3 s，明显比启用优化时更长。
+性能对比（粗略）：
+平均延迟：未优化 / 优化 ≈ 348.95 / 38.70 ≈ 9.0×（约 9 倍）
+模型加载时间约减少 ~1.9×（63s → 33s）
+稳定性：启用优化后 Std dev 大幅下降，异常延迟（spike）消失。
+五、结论
+启用 custom 优化能显著提升延迟性能并提高稳定性：平均延迟下降约 9 倍，P99 从 ~1s 降到 ~46 ms，标准差显著降低。
+未启用优化时存在少数严重的延迟峰值，需排查导致峰值的根因（例如加载、内存交换、GC、线程调度或资源竞争等）。
+warmup 的提示（"consider extending warmup to cover this shape/config."）建议采纳：更充分的 warmup 能减少首次或特殊输入形状导致的延迟波动。
 consider extending warmup to cover this shape/config.
   warmup 1: top1_sid=5154174410510, logprob=-2.9549
   warmup 2: top1_sid=5154174410510, logprob=-2.9549

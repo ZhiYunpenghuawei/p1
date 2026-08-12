@@ -32,15 +32,15 @@
 
 ### 3.1 吞吐量（Samples/s）
 
-![吞吐量对比](charts/throughput_samples_per_sec.png)
+![吞吐量对比](throughput_samples_per_sec.png)
 
 ### 3.2 平均延迟（Avg, ms）
 
-![平均延迟对比](charts/latency_avg_ms.png)
+![平均延迟对比](latency_avg_ms.png)
 
 ### 3.3 P95 延迟（ms）
 
-![P95 延迟对比](charts/latency_p95_ms.png)
+![P95 延迟对比](latency_p95_ms.png)
 
 ## 4. 汇总对比表（优化后 vs 无优化，仅 Beam 64/128）
 

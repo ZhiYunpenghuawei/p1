@@ -41,15 +41,15 @@
 
 #### 3.1.1 吞吐（Samples/s）
 
-![吞吐对比](charts/throughput_samples_per_sec.png)
+![吞吐对比](throughput_samples_per_sec.png)
 
 #### 3.1.2 平均延迟（Avg, ms）
 
-![平均延迟对比](charts/latency_avg_ms.png)
+![平均延迟对比](latency_avg_ms.png)
 
 #### 3.1.3 P95 延迟（ms）
 
-![P95 延迟对比](charts/latency_p95_ms.png)
+![P95 延迟对比](latency_p95_ms.png)
 
 ### 3.2 Batch×Beam 扫描（InLen=4096）
 
@@ -57,15 +57,15 @@
 
 #### 3.2.1 吞吐（Samples/s）
 
-![Batch 吞吐](charts/throughput_batch.png)
+![Batch 吞吐](throughput_batch.png)
 
 #### 3.2.2 平均延迟（Avg, ms）
 
-![Batch 平均延迟](charts/latency_avg_batch.png)
+![Batch 平均延迟](latency_avg_batch.png)
 
 #### 3.2.3 P95 延迟（ms）
 
-![Batch P95 延迟](charts/latency_p95_batch.png)
+![Batch P95 延迟](latency_p95_batch.png)
 
 ## 4. 汇总表
 

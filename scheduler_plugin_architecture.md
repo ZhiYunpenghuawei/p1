@@ -172,7 +172,7 @@ flowchart TD
 flowchart LR
     subgraph MAIN["Main 进程"]
         PLUGIN[general_plugins 加载<br>initialize_runtime]
-        CFG[配置解析<br>buckets / admission_mode]
+        CFG[配置解析<br>buckets / admission_mode / assume_grouped]
     end
     subgraph EC["EngineCore 子进程"]
         SCH2[Scheduler<br>schedule 被 patch 包装]
@@ -209,6 +209,8 @@ flowchart LR
 | 组批请求（`skip_wait`） | bucket 校验通过 | 直发 |
 | 组批请求 | bucket 校验失败 | 报错拒绝 |
 
+> `assume_grouped=true` 时，**普通请求（无标记）也默认视为组批**，直接走直发路径（见 3.3）。
+
 ### 3.2 决策流程
 
 ```mermaid
@@ -227,11 +229,14 @@ flowchart TD
     E --> W[Worker 图执行<br>prefill 一次 + decode 按 beam 展开]
 ```
 
+> `assume_grouped=true` 时，请求到达后跳过 FIFO 分支，直接走右侧“组批直发”路径。
+
 ### 3.3 混合规则与配置
 
 - 组批请求是“显式契约”，**不进 FIFO 队列**，不与单请求混拼；
 - FIFO 队列只收单请求（终版不做组批拆开补队的合并逻辑）；
-- `admission_mode` 按模型配置：`auto`（默认，两种都支持）/ `single_only` / `grouped_only`。
+- `admission_mode` 按模型配置：`auto`（默认，两种都支持）/ `single_only` / `grouped_only`；
+- **`assume_grouped`（初始配置）**：设为 `true` 时，**默认所有请求都按“业务方自己组 batch”处理**——跳过 FIFO 攒批，单条请求也直接按 bucket 发车（不足固定 batch 则 padding）。适合业务方全量自组批的部署；等价于强制 `admission=grouped, skip_wait=true`。
 
 ---
 
@@ -367,7 +372,8 @@ class RequestAdapter:
 
     def parse(self, req) -> Admission:
         """返回 Admission.SINGLE 或 Admission.GROUPED。
-        判定依据：请求是否携带 skip_wait。"""
+        判定依据：请求是否携带 skip_wait；
+        assume_grouped=true 时恒返回 GROUPED（单条也直发）。"""
 
     def is_grouped(self, req) -> bool: ...
     def extract_beam_width(self, req) -> int:
@@ -402,7 +408,9 @@ class BucketRouter:
 ```python
 class BatchAssembler:
     def __init__(self, batch_size: int, max_wait_ms: float,
-                 admission_mode: str = "auto") -> None: ...
+                 admission_mode: str = "auto",
+                 assume_grouped: bool = False) -> None:
+        """assume_grouped=true 时不做 FIFO 攒批，全部走 dispatch_group 直发。"""
 
     def enqueue(self, req, bucket: int) -> None:
         """单请求进入对应 bucket 的 FIFO 队列。
@@ -774,6 +782,7 @@ patch(
 ```yaml
 scheduler_plugin:
   admission_mode: auto            # auto | single_only | grouped_only
+  assume_grouped: false           # true 时默认全部按业务方组批（不走 FIFO 攒批）
   batch_size: 8
   length_buckets: [512, 1024, 2048]
   beam_buckets: [128, 256]        # 3~4 种时扩展

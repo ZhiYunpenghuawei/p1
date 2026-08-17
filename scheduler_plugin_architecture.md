@@ -458,28 +458,126 @@ class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
 
 ### 7.3 我们现在的 monkey patch 与插件系统：一样吗？区别？
 
-**相同点**：原理完全一样——都是运行时替换类的个别方法，不复制整个类。我们本地 `engine_core_patch.py` 就是这么干的：
+#### 7.3.1 我们 fork 的 monkey patch：源码与逻辑
+
+**核心逻辑**：保存原方法 → 包装 → 重新赋值 → 打标记防重复 → 在子进程入口重新应用。
+
+源码证据（`vllm_gr/v1/engine/engine_core_patch.py`）：
 
 ```python
-_original_schedule = Scheduler.schedule          # 保存原方法
-...
-def patched_schedule(self): ...                  # 包装
-...
-Scheduler.schedule = patched_schedule            # 重新赋值
+# ① 保存原方法，包装后重新赋值（Scheduler.schedule）
+_original_schedule = Scheduler.schedule
+
+@wraps(_original_schedule)
+def patched_schedule(self):
+    ...
+    output = _original_schedule(self)          # 先调原版
+    output.beam_data = build_beam_request_metadata(...)  # 再附加 beam 信息
+    return output
+
+Scheduler.schedule = patched_schedule          # 重新赋值
+setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)  # 标记防重复
 ```
 
-**区别**：
+```python
+# ② 子进程入口 wrapper：spawn 出的 EngineCore 子进程里模块全新，
+#    Scheduler 是原版，所以必须在子进程启动时重新打一遍 patch
+def run_engine_core(*args, **kwargs):
+    """...In the spawned child process, all modules are freshly imported, so
+    EngineCoreProc.run_engine_core is the original unpatched version.
+    We apply our patches first, then delegate to the original."""
+    apply_engine_core_child_patches()   # 请求 patch + 调度 patch + worker patch
+    return original_run(*args, **kwargs)
+```
 
-| 维度 | 我们现在的 monkey patch（patch.py / engine_core_patch.py） | vLLM general_plugins（VLLMPatch） |
+```python
+# ③ 集中注册表 + 校验（vllm_gr/patch.py）
+def _required_beam_patches():
+    return (
+        BeamPatch(name="flat_logprobs", apply=..., verify=_validate_flat_logprobs_patch),
+        BeamPatch(name="batch_and_fork", apply=..., verify=_validate_batch_and_fork_patch),
+        ...
+    )
+_initialize_beam_patch_plan(_required_beam_patches())   # 逐个 apply + verify
+```
+
+**逻辑要点**：
+
+- **替换方式**：保存原方法 → 包装 → 重新赋值（与插件系统相同）；
+- **防重复**：用 `setattr(marker)` 标记 + `_run_engine_core_active` 重入守卫；
+- **子进程生效**：靠 fork 自己 patch 了 `run_engine_core` 子进程入口，在子进程里重新 apply——这是 vllm_gr 能用的根本原因；
+- **校验**：每个 patch 有 `verify` 函数，启动后输出 `BeamPatchReport`。
+
+#### 7.3.2 vLLM general_plugins：源码与逻辑
+
+**核心逻辑**：patch 定义为 `VLLMPatch[Target]` 子类 → `manager.register(name, PatchClass)` 注册 → 每进程启动早期自动加载。
+
+源码证据（博客原样）：
+
+```python
+# ① patch 定义：只替换目标类的某一个方法
+class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
+    @min_vllm_version("0.8.0")
+    def apply(self, target_cls):
+        target_cls.schedule = priority_schedule   # 只替换 schedule
+
+# ② 注册与启用
+def register_patches():
+    manager.register('PriorityScheduler', PrioritySchedulerPatch)
+    manager.apply_from_env()                      # 按环境变量选择启用
+
+# ③ setup.py 注册 entry point
+entry_points={
+    'vllm.general_plugins': ['custom_patches = vllm_custom_patches:register_patches']
+}
+```
+
+```text
+# ④ vLLM 生命周期：每个进程（main / EngineCore / worker）启动早期
+load_general_plugins() → 发现 entry point → 调用 register_patches()
+→ manager.apply_from_env() → VLLMPatch.apply() → 替换方法
+→ 之后才创建 Scheduler / 加载模型
+```
+
+**逻辑要点**：
+
+- **替换方式**：`apply()` 里 `target_cls.schedule = ...`（与我们的重新赋值相同）；
+- **子进程生效**：由 vLLM 官方 `load_general_plugins()` 在**每个进程**保证，不需要自己 patch 子进程入口；
+- **版本守卫**：`@min_vllm_version`；
+- **选择性启用**：环境变量按 patch 名。
+
+#### 7.3.3 源码级逐行对比
+
+| 动作 | 我们（fork monkey patch） | vLLM general_plugins |
 |---|---|---|
-| 加载时机 | 主进程 import 时执行 | **每个进程**（含 EngineCore / worker）启动早期自动调用 |
-| EngineCore 子进程生效 | 不一定（Scheduler 跑在子进程，monkey patch 常失效） | 保证生效 |
-| 版本管理 | 无，升级 vLLM 靠手工同步 | `@min_vllm_version` 版本守卫 |
-| 选择性启用 | 无，启动即全部打上 | 环境变量按 patch 名启用 |
-| 官方支持 | 无（黑盒绕开 API） | `vllm.general_plugins` 是官方扩展点 |
-| 分发 | fork 内散落 | pip 插件包独立分发 |
+| 替换方法 | `Scheduler.schedule = patched_schedule` | `target_cls.schedule = priority_schedule`（`apply()` 内） |
+| 保存原方法 | `_original_schedule = Scheduler.schedule`（包装后调用） | 博客示例直接替换；如需调用原版需自行保存 |
+| 注册 | `BeamPatch(name, apply, verify)` 元组表 | `manager.register('PriorityScheduler', PrioritySchedulerPatch)` |
+| 应用入口 | `_initialize_beam_patch_plan(...)` 手动调用 | `manager.apply_from_env()` |
+| 子进程生效 | `run_engine_core` wrapper 里重新 apply（fork 自己写） | `load_general_plugins()` 每进程自动调用 |
+| 防重复 | `setattr(marker)` + 重入守卫 | manager 注册一次；vLLM 每进程只 load 一次 |
+| 校验/守卫 | 每个 patch 的 `verify()` + `BeamPatchReport` | `@min_vllm_version` 版本守卫 |
 
-**结论与建议**：我们现在是“fork 内的 monkey patch”，和插件系统机制相同、但缺了“子进程加载 + 版本管理 + 独立分发”三件事。建议把 `patch.py` 里**调度相关的 patch**（`Scheduler.schedule` 等）逐步收拢成 `vllm.general_plugins` 包，用 `VLLMPatch` 写法重写，其它模型/推理 patch 可以继续留在 fork 内。
+#### 7.3.4 逻辑级对比
+
+| 维度 | 我们（fork monkey patch） | vLLM general_plugins |
+|---|---|---|
+| 生效机制 | fork 改子进程入口，spawn 后子进程里重打 | 官方每进程启动早期自动加载 |
+| patch 载体 | 散落在 `vllm_gr/*.py` + `BeamPatch` 注册表 | 独立 pip 包 + `setup.py` entry point |
+| 子进程 | 自己处理（wrapper 重打） | 官方保证 |
+| 版本管理 | 无，升级 vLLM 手工同步 | `@min_vllm_version` |
+| 选择性启用 | 按进程分工两套 patch 表（required / engine_core） | 环境变量按 patch 名 |
+| 升级 vLLM | rebase fork、核对散落 patch、回归 | `pip install --upgrade vllm`，插件不动 |
+| 分发 | 整个 fork | 独立小 pip 包 |
+| 官方支持 | 无（黑盒绕开 API） | `vllm.general_plugins` 官方扩展点 |
+
+#### 7.3.5 结论
+
+**机制等价**：两种方式都是“运行时替换类的个别方法、不复制整个类”，本质相同。
+
+**差异只在三件事**：① 谁保证子进程生效（fork 自己写 wrapper vs 官方每进程加载）；② 版本与启用管理（无 vs `@min_vllm_version` + 环境变量）；③ 分发形态（整个 fork vs 独立 pip 包）。
+
+**建议**：把 `patch.py` 里**调度相关的 patch**（`Scheduler.schedule` 等）收拢成 `vllm.general_plugins` 包，用 `VLLMPatch` 写法重写；模型/推理类 patch 可继续留在 fork 内。
 
 ### 7.4 三种方案对比
 

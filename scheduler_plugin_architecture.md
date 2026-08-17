@@ -579,6 +579,68 @@ load_general_plugins() → 发现 entry point → 调用 register_patches()
 
 **建议**：把 `patch.py` 里**调度相关的 patch**（`Scheduler.schedule` 等）收拢成 `vllm.general_plugins` 包，用 `VLLMPatch` 写法重写；模型/推理类 patch 可继续留在 fork 内。
 
+#### 7.3.6 现状核对：我们其实已经接入 general_plugins，子进程生效已做到
+
+**结论：✅ 子进程生效已经做到。但机制是两层配合，不是“插件在子进程里直接 patch Scheduler”。**
+
+证据：
+
+```toml
+# pyproject.toml L60-61
+[project.entry-points."vllm.general_plugins"]
+vllm_gr = "vllm_gr.plugin:register"
+```
+
+```python
+# vllm_gr/plugin.py —— 每个进程（main / EngineCore / worker）都会执行
+def register():
+    state = initialize_runtime()   # re_apply_patches() + _register_models()
+```
+
+```python
+# vllm_gr/v1/engine/engine_core_patch.py —— 子进程生效的真正落点
+def apply_engine_core_child_patches():
+    apply_engine_core_request_patches()
+    apply_scheduler_patch()        # ← 这里才替换 Scheduler.schedule
+    apply_worker_patches()
+
+def run_engine_core(*args, **kwargs):
+    """...In the spawned child process, all modules are freshly imported, so
+    EngineCoreProc.run_engine_core is the original unpatched version.
+    We apply our patches first, then delegate to the original."""
+    apply_engine_core_child_patches()
+    return original_run(*args, **kwargs)
+```
+
+**机制拆解**：
+
+1. `general_plugins` 每进程加载 `register()` → `initialize_runtime()` → `re_apply_patches()`，保证 **wrapper 被安装**、patch 状态可验证；
+2. `batch_and_fork` patch 把 `EngineCoreProc.run_engine_core` 换成我们的 wrapper；
+3. EngineCore **子进程 spawn 后**（模块全新、Scheduler 是原版），wrapper 调用 `apply_engine_core_child_patches()`，**在这里** `Scheduler.schedule` 才被替换。
+
+所以准确表述是：**“子进程生效”是我们 fork 自己用 wrapper 实现的**；插件系统只保证了 wrapper 被装上。Scheduler 在插件加载时往往还没被 import，插件本身并没有直接 patch 它。
+
+#### 7.3.7 那我们现在的代码也能精准替换，VLLMPatch 的意义是什么？
+
+**功能层：等价。** 我们的 `Scheduler.schedule = patched_schedule` 就是精准替换单个方法、不复制整类，和 VLLMPatch `apply()` 里的 `target_cls.schedule = priority_schedule` 本质相同。
+
+**工程层：有明确差异。** VLLMPatch 的意义不是“能不能替换”，而是把“替换什么、怎么管理、怎么分发”声明化：
+
+| 需求 | 我们现状（函数式 patch） | VLLMPatch 声明式类 |
+|---|---|---|
+| 精准替换单个方法 | ✅ 已做到 | ✅ |
+| 版本守卫（`@min_vllm_version`） | ❌ 无 | ✅ |
+| 按名启用（`apply_from_env`） | ❌ 启动即全打 | ✅ |
+| 注册集中管理 | ⚠️ `BeamPatch` 注册表（半集中） | ✅ 类 + manager |
+| 独立分发（pip 包） | ❌ 依赖 fork | ✅ |
+| 子进程生效 | ⚠️ 自己写 wrapper（fork 私有，升级易碎） | ✅ 官方保证 |
+
+**分析结论**：
+
+- 我们的代码在功能上**已经等价**（都能精准替换、都能子进程生效），所以“引入 VLLMPatch”不是“从不能做到能做”，而是**工程升级**；
+- 真正值得做的三件事：① 给 patch 加版本守卫；② 支持按名选择性启用（多模型一个 build）；③ 把“子进程生效”从 fork 私有 wrapper 换成官方机制，降低升级成本；
+- 迁移方式：保留 `initialize_runtime()` 作为总入口，把 `patch.py` 里的调度类 patch 逐条改写成 `class GRBatchSchedulerPatch(VLLMPatch[Scheduler])` 并注册到 manager；`run_engine_core` wrapper 逐步退化为兜底。
+
 ### 7.4 三种方案对比
 
 | 方案 | 机制 | 适合场景 | 结论 |

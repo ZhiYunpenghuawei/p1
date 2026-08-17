@@ -96,7 +96,7 @@ flowchart LR
 
 - **双路径入口、单一执行出口**：单请求和组批最终都变成同一个 `BatchSpec`，引擎/图执行完全共用；
 - **最小改动接入**：复用现有 `apply_scheduler_patch()` / `initialize_runtime()` 机制，不引入新框架、不换调度类；
-- **成图对接接口**：给 prefill / decode 成图提供明确接口（Provider），同事按接口实现即可接入；
+- **成图对接接口**：给 prefill / decode 成图提供明确接口（Provider），按接口实现即可接入；
 - **图保持固定**：warmup 全量捕获、bucket 标记、缺图报错，不引入运行时捕获；
 - **padding 时机固定**：worker 图输入准备阶段，长度走 metadata（见 0.1）；
 - **图数量可预算**：按 0.2 的公式在启动时确认，内存可提前规划。
@@ -111,7 +111,7 @@ flowchart LR
 flowchart TD
     subgraph L1["① 协议/输入层（Serving / API）"]
         S1[单条请求]
-        S2[业务方组批<br>skip_wait / group_hint]
+        S2[业务方组批<br>skip_wait]
     end
     subgraph L2["② 调度插件 vllm_gr.scheduling"]
         A[RequestAdapter<br>区分单/批]
@@ -175,7 +175,7 @@ flowchart LR
 | 输入 | 判定 | 路径 |
 |---|---|---|
 | 普通请求（无标记） | `admission_mode` 允许 single | FIFO 攒批 |
-| 组批请求（`skip_wait` / `group_hint`） | bucket 校验通过 | 直发 |
+| 组批请求（`skip_wait`） | bucket 校验通过 | 直发 |
 | 组批请求 | bucket 校验失败 | 报错拒绝 |
 
 ### 3.2 决策流程
@@ -227,12 +227,12 @@ vllm_gr/scheduling/
 
 | 模块 | 输入 | 输出 | 关键逻辑 |
 |---|---|---|---|
-| `adapter.py` | 原始请求 | `AdmissionKind`（single/grouped） | 读 `skip_wait` / `group_hint` |
+| `adapter.py` | 原始请求 | `AdmissionKind`（single/grouped） | 读 `skip_wait` |
 | `router.py` | 请求/组 | bucket + beam 信息 | 第一个 ≥ 实际长度的 bucket |
 | `assembler.py` | bucket 队列 / 组 | `BatchSpec` | FIFO 攒批、超时发车、直发 |
 | `validator.py` | BatchSpec | 通过/拒绝 | bucket ∈ 配置 ∧ 图存在 |
 | `registry.py` | bucket/step | 图句柄 | warmup 全量捕获后的查询表 |
-| `graph.py` | — | Provider 接口 | 成图同事按接口实现 prefill/decode 图 |
+| `graph.py` | — | Provider 接口 | 成图按接口实现 prefill/decode 图 |
 | `scheduler.py` | BatchSpec 流 | SchedulerOutput | 按 (bucket, step) 分组输出 |
 | `plugin.py` | — | 运行时初始化 | 现有 `register()` → `initialize_runtime()` |
 
@@ -243,7 +243,6 @@ classDiagram
     class RequestAdapter {
         +parse(req) AdmissionKind
         +is_grouped(req) bool
-        +extract_group_hint(req) str|None
     }
     class BucketRouter {
         +route(req) int
@@ -279,7 +278,6 @@ classDiagram
         +bucket: int
         +admission: str
         +skip_wait: bool
-        +group_hint: str|None
     }
 
     RequestAdapter --> BucketRouter
@@ -302,7 +300,6 @@ class BatchSpec:
     bucket: int                       # 长度 bucket
     admission: str                    # "single" | "grouped"
     skip_wait: bool = False
-    group_hint: str | None = None
     created_at: float
 ```
 
@@ -317,7 +314,6 @@ JSON 示例（组批）：
   "bucket": 1024,
   "admission": "grouped",
   "skip_wait": true,
-  "group_hint": "recall-1",
   "created_at": 1723000000.0
 }
 ```
@@ -340,10 +336,9 @@ class RequestAdapter:
 
     def parse(self, req) -> Admission:
         """返回 Admission.SINGLE 或 Admission.GROUPED。
-        判定依据：请求是否携带 skip_wait / group_hint。"""
+        判定依据：请求是否携带 skip_wait。"""
 
     def is_grouped(self, req) -> bool: ...
-    def extract_group_hint(self, req) -> str | None: ...
     def extract_beam_width(self, req) -> int:
         """每个请求的 beam_width，用于 beam 展开信息。"""
 ```
@@ -452,7 +447,7 @@ class GRBatchScheduler:
 | `consume_batch()` | **新增** | BatchSpec 入队入口 |
 | `_validate_batch_graphs()` | **新增** | 图存在性前置校验 |
 | `add_request()` / `update_from_output()` / `has_requests()` | **不动** | 原版逻辑保持 |
-| EngineCore `process_input_sockets()`（协议扩展） | 覆盖（已有先例） | 解析 `skip_wait` / `group_hint` / `bucket` 字段 |
+| EngineCore `process_input_sockets()`（协议扩展） | 覆盖（已有先例） | 解析 `skip_wait` / `bucket` 字段 |
 
 #### 4.5.7 调用链
 
@@ -563,8 +558,9 @@ flowchart TD
 - 若采用逐层成图（ACS 风格）或 prefill piecewise，物理图数 = 逻辑图数 × 每图物理段数（例如 decode 逐层 = 层数+1）；
 - 终版默认**每张逻辑图一张物理图**（不做逐层拆分），图数量即 30~52，内存可预算。
 
-### 6.4 成图接口
-分工：调度 / 组批 / 校验由本架构负责；**成图（warmup 捕获、静态 buffer、metadata、replay）接口**，注册进 `GraphRegistry` 即可对接，双方互不阻塞。
+### 6.4 成图对接接口（给 prefill / decode 成图）
+
+分工：调度 / 组批 / 校验由本架构负责；**成图（warmup 捕获、静态 buffer、metadata、replay）按下面接口实现**，注册进 `GraphRegistry` 即可对接。
 
 ```python
 class PrefillGraphProvider(Protocol):
@@ -605,14 +601,14 @@ class GraphRegistry:
 
 **对接约定**：
 
-1. 实现 `PrefillGraphProvider` / `DecodeGraphProvider`（各自 backend：CUDA / ACL）；
+1. 按 `PrefillGraphProvider` / `DecodeGraphProvider` 接口实现成图（各自 backend：CUDA / ACL）；
 2. 在 `initialize_runtime()` 或注册阶段调用 `registry.register_*_provider(...)`；
 3. 调度 / 组批 / 校验只与 `GraphRegistry` 交互，不感知具体 backend；
 4. 接口约束：形状由 (bucket, step, beam_width) 决定；真实长度只走 metadata（见 0.1）；warmup 全量、缺图报错。
 
 ---
 
-## 7.  vLLM 的接入
+## 7. 与 vLLM 的接入（最小改动，基于现有机制）
 
 ### 7.1 插件机制简介（先搞懂 VLLMPatch）
 
@@ -633,13 +629,13 @@ class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
 
 **回答你的问题**：对，`class XxxPatch(VLLMPatch[Scheduler])` 里只写要改的方法，`apply()` 里只给目标类换掉/新增那一个方法——这就是“单个方法替换，不复制整个类”。
 
-### 7.2 替换原版调度函数
+### 7.2 我们需要哪些类、替换原版调度哪些函数
 
 | 改动 | 目标类（原版） | 替换/新增的函数 | 做什么 |
 |---|---|---|---|
 | 新增 `apply_gr_batch_scheduler_patch()` | `Scheduler` | 包装 `schedule()`（仿现有 `apply_scheduler_patch()`） | 消费 BatchSpec；按 (bucket, step) 分组输出；bucket 不在配置内报错；原版调度逻辑保留 |
 | 注册表加一项 | `vllm_gr/patch.py` | `_engine_core_beam_patches()` 加 `gr_batch_scheduler` 项 | 跟随现有 re-apply / verify 机制，子进程生效 |
-| 协议扩展（可选） | `Request` | 新增属性 `skip_wait` / `group_hint` / `lengths` / `beam_width` | 协议字段透传到调度器 |
+| 协议扩展（可选） | `Request` | 新增属性 `skip_wait` / `lengths` / `beam_width` | 协议字段透传到调度器 |
 | EngineCore 协议扩展 | `EngineCore` / `EngineCoreProc` | 扩展 `process_input_sockets()` / ADD_BATCH 解码 | 单/批协议进入引擎（本地已有先例） |
 | `GraphRegistry` / `GraphValidator` / `BatchAssembler` / `BucketRouter` / `graph.py` | — | **新增模块，不替换任何原版函数** | 图注册表、成图 Provider 接口、bucket 校验、组批逻辑 |
 
@@ -713,11 +709,11 @@ patch(
 
 **改动点 3：协议字段进入 EngineCore**
 
-- `BatchSpec`（含 `lengths` / 统一 `beam_width` / `skip_wait` / `group_hint`）通过扩展 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE` 传入（本地已有协议扩展先例）。
+- `BatchSpec`（含 `lengths` / 统一 `beam_width` / `skip_wait`）通过扩展 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE` 传入（本地已有协议扩展先例）。
 
 **改动点 4：GraphRegistry + Provider 注册（见 6.4）**
 
-- 成图同事实现 Provider 并注册；调度侧只依赖 `GraphRegistry`。
+- 成图 Provider 实现并注册；调度侧只依赖 `GraphRegistry`。
 
 **不需要做的事**：
 
@@ -761,7 +757,7 @@ scheduler_plugin:
 
 ## 10. 实施步骤
 
-1. **数据契约**：`BatchSpec`（含 `lengths` / 统一 `beam_width`）与协议字段（`skip_wait` / `group_hint`）；
+1. **数据契约**：`BatchSpec`（含 `lengths` / 统一 `beam_width`）与协议字段（`skip_wait`）；
 2. **调度 patch**：`engine_core_patch.py` 新增 `apply_gr_batch_scheduler_patch()`，`_engine_core_beam_patches()` 注册表加一项；
 3. **成图接口**：`graph.py` 定义 `PrefillGraphProvider` / `DecodeGraphProvider`，`GraphRegistry` 支持注册与 warmup；
 4. **单/批双路径**：adapter/router/assembler 落地，FIFO 按 (bucket, beam_width) 攒批、组批直发；
@@ -785,4 +781,4 @@ scheduler_plugin:
 
 ## 附录：一句话总结
 
-**单请求走 FIFO 攒批、组批走 skip_wait 直发，在 BatchSpec（带每个请求长度、批内统一 beam_width）处汇合；padding 发生在 worker 图输入准备（长度走 metadata）；图数量 30~52 可预算、warmup 全量捕获、缺图报错；接入采用最小改动——在现有 `apply_scheduler_patch()` 机制上新增一个调度 patch，成图同事按 Provider 接口对接，输入方式不同，执行链完全共用。**
+**单请求走 FIFO 攒批、组批走 skip_wait 直发，在 BatchSpec（带每个请求长度、批内统一 beam_width）处汇合；padding 发生在 worker 图输入准备（长度走 metadata）；图数量 30~52 可预算、warmup 全量捕获、缺图报错；接入采用最小改动——在现有 `apply_scheduler_patch()` 机制上新增一个调度 patch，成图按 Provider 接口对接，输入方式不同，执行链完全共用。**

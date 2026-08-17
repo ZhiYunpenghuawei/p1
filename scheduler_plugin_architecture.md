@@ -95,7 +95,8 @@ flowchart LR
 ### 1.2 设计目标
 
 - **双路径入口、单一执行出口**：单请求和组批最终都变成同一个 `BatchSpec`，引擎/图执行完全共用；
-- **插件化接入 vLLM**：用 `vllm.general_plugins`（方案 B）打包分发，`SchedulerConfig.scheduler_cls` 作为内部注入手段；
+- **最小改动接入**：复用现有 `apply_scheduler_patch()` / `initialize_runtime()` 机制，不引入新框架、不换调度类；
+- **成图对接接口**：给 prefill / decode 成图提供明确接口（Provider），同事按接口实现即可接入；
 - **图保持固定**：warmup 全量捕获、bucket 标记、缺图报错，不引入运行时捕获；
 - **padding 时机固定**：worker 图输入准备阶段，长度走 metadata（见 0.1）；
 - **图数量可预算**：按 0.2 的公式在启动时确认，内存可提前规划。
@@ -119,7 +120,7 @@ flowchart TD
         V[GraphValidator<br>bucket → 图存在性]
     end
     subgraph L3["③ EngineCore（子进程）"]
-        SCH[GRBatchScheduler<br>继承 Scheduler<br>scheduler_cls 注入]
+        SCH[调度 patch<br>包装 Scheduler.schedule<br>消费 BatchSpec]
         M[KV / 预算管理]
     end
     subgraph L4["④ Worker（GPU/NPU）"]
@@ -139,11 +140,11 @@ flowchart TD
 ```mermaid
 flowchart LR
     subgraph MAIN["Main 进程"]
-        PLUGIN[general_plugins 加载<br>VLLMPatch 注册]
-        CFG[配置解析<br>scheduler_cls / buckets / admission_mode]
+        PLUGIN[general_plugins 加载<br>initialize_runtime]
+        CFG[配置解析<br>buckets / admission_mode]
     end
     subgraph EC["EngineCore 子进程"]
-        SCH2[GRBatchScheduler<br>由 scheduler_cls 实例化]
+        SCH2[Scheduler<br>schedule 被 patch 包装]
     end
     subgraph WK["Worker 子进程"]
         WR[图注册表 / KV / replay]
@@ -216,9 +217,10 @@ vllm_gr/scheduling/
 ├── assembler.py         # BatchAssembler：FIFO / 直发状态机
 ├── validator.py         # GraphValidator：bucket → 图存在性
 ├── registry.py          # GraphRegistry：warmup 图注册表（Worker 侧）
-├── scheduler.py         # GRBatchScheduler(Scheduler)：EngineCore 侧
+├── graph.py             # 成图对接接口：PrefillGraphProvider / DecodeGraphProvider
+├── scheduler.py         # GRBatchScheduler：调度逻辑（由 patch 挂接 schedule）
 ├── config.py            # per-model 配置加载与校验
-└── plugin.py            # general_plugins 注册与 VLLMPatch 定义
+└── plugin.py            # 现有 general_plugins 入口（initialize_runtime 机制）
 ```
 
 ### 4.2 模块职责
@@ -230,8 +232,9 @@ vllm_gr/scheduling/
 | `assembler.py` | bucket 队列 / 组 | `BatchSpec` | FIFO 攒批、超时发车、直发 |
 | `validator.py` | BatchSpec | 通过/拒绝 | bucket ∈ 配置 ∧ 图存在 |
 | `registry.py` | bucket/step | 图句柄 | warmup 全量捕获后的查询表 |
+| `graph.py` | — | Provider 接口 | 成图同事按接口实现 prefill/decode 图 |
 | `scheduler.py` | BatchSpec 流 | SchedulerOutput | 按 (bucket, step) 分组输出 |
-| `plugin.py` | — | VLLMPatch 注册 | entry point 加载 |
+| `plugin.py` | — | 运行时初始化 | 现有 `register()` → `initialize_runtime()` |
 
 ### 4.3 类图
 
@@ -264,18 +267,19 @@ classDiagram
         -graphs: dict[tuple, Graph]
     }
     class GRBatchScheduler {
-        +schedule() SchedulerOutput
+        +run(scheduler_self) SchedulerOutput
         +consume_batch(spec) None
         -batch_queue: deque[BatchSpec]
     }
     class BatchSpec {
         +batch_id: str
         +request_ids: tuple
+        +lengths: dict  # request_id -> 实际长度
+        +beam_width: int  # 批内统一
         +bucket: int
         +admission: str
         +skip_wait: bool
         +group_hint: str|None
-        +beam_widths: dict
     }
 
     RequestAdapter --> BucketRouter
@@ -293,12 +297,12 @@ classDiagram
 class BatchSpec:
     batch_id: str
     request_ids: tuple[str, ...]
+    lengths: dict[str, int]           # request_id -> 实际长度（prefill 用）
+    beam_width: int                   # 批内统一 beam width（混批校验失败则拒绝）
     bucket: int                       # 长度 bucket
     admission: str                    # "single" | "grouped"
     skip_wait: bool = False
     group_hint: str | None = None
-    beam_widths: dict[str, int] = field(default_factory=dict)
-    expected_len: int
     created_at: float
 ```
 
@@ -308,15 +312,21 @@ JSON 示例（组批）：
 {
   "batch_id": "grp-1723-1024",
   "request_ids": ["r1", "r2", "r3"],
+  "lengths": {"r1": 900, "r2": 1000, "r3": 980},
+  "beam_width": 128,
   "bucket": 1024,
   "admission": "grouped",
   "skip_wait": true,
   "group_hint": "recall-1",
-  "beam_widths": {"r1": 128, "r2": 256, "r3": 128},
-  "expected_len": 1000,
   "created_at": 1723000000.0
 }
 ```
+
+**约束**：
+
+- `lengths` 必须覆盖所有 `request_ids`（每个请求的实际长度，prefill 图输入准备按它走 metadata）；
+- **同一 BatchSpec 内 `beam_width` 必须一致**：组批时若发现 beam width 混批 → 拒绝该组（图无法按多种 beam 宽跑）；单请求 FIFO 攒批时只把同 beam width 的请求攒进同一 batch；
+- `bucket` = 组内最大长度归桶的结果（如 `max(900, 1000, 980)=1000 → 1024`）。
 
 ### 4.5 接口定义（详细）
 
@@ -369,7 +379,8 @@ class BatchAssembler:
                  admission_mode: str = "auto") -> None: ...
 
     def enqueue(self, req, bucket: int) -> None:
-        """单请求进入对应 bucket 的 FIFO 队列。"""
+        """单请求进入对应 bucket 的 FIFO 队列。
+        队列按 (bucket, beam_width) 分桶：只有相同 beam width 才可攒进同一 batch。"""
 
     def dispatch_group(self, group, bucket: int) -> BatchSpec:
         """组批直发：不进队列，直接生成 BatchSpec（skip_wait=True）。"""
@@ -407,41 +418,40 @@ class GraphRegistry:
     def kv_slice(self, bucket: int) -> KVSlice: ...
 ```
 
-#### 4.5.5 GRBatchScheduler（核心：继承 vLLM Scheduler）
+#### 4.5.5 GRBatchScheduler（核心：调度逻辑，由 patch 挂接到 Scheduler.schedule）
 
 ```python
-class GRBatchScheduler(Scheduler):
-    """替换原版 Scheduler，消费 BatchSpec 并保持原版连续调度语义。"""
+class GRBatchScheduler:
+    """调度逻辑主体。不替换 Scheduler 类——
+    由 apply_gr_batch_scheduler_patch() 包装 Scheduler.schedule，
+    在包装函数内调用本类的逻辑，原版连续调度语义保持不变。"""
 
-    def __init__(self, *args, batch_queue=None, config=None, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, batch_queue=None, config=None):
         self.batch_queue = batch_queue      # BatchSpec 队列（由插件/引擎填充）
         self.gr_config = config
 
-    def schedule(self) -> SchedulerOutput:
-        """唯一必须覆盖的函数。流程：
+    def run(self, scheduler_self) -> SchedulerOutput:
+        """被 patched Scheduler.schedule 调用。流程：
         1. 先消费 batch_queue 里的 BatchSpec，把请求放入 running/waiting；
-        2. 调用父类 schedule()（原版 token 预算 / KV 分配逻辑不变）；
+        2. 调用原版 Scheduler.schedule（token 预算 / KV 分配逻辑不变）；
         3. 输出前附加 bucket 分组信息（复用现有 beam_data 机制）。"""
 
     def consume_batch(self, spec: BatchSpec) -> None:
         """新增：BatchSpec 进入调度器（由引擎/插件调用）。"""
 
     def _validate_batch_graphs(self, spec: BatchSpec) -> None:
-        """新增：发车前 GraphValidator 校验，缺图抛错。"""
-
-    # 以下全部继承原版，不覆盖：
-    # add_request() / update_from_output() / has_requests() / free_finished_request() ...
+        """新增：发车前校验（bucket 在配置内、图存在、beam_width 批内一致），缺图抛错。"""
 ```
 
-#### 4.5.6 覆盖 vs 新增 vs 继承
+#### 4.5.6 包装 vs 新增
 
 | 函数 | 类型 | 说明 |
 |---|---|---|
-| `schedule()` | **覆盖** | 消费 BatchSpec → 调父类 → 附加 bucket 分组 |
+| `Scheduler.schedule`（被包装） | **包装** | 消费 BatchSpec → 调原版 → 附加 bucket 分组 |
+| `GRBatchScheduler.run()` | **新增** | patched schedule 里调用的调度逻辑 |
 | `consume_batch()` | **新增** | BatchSpec 入队入口 |
 | `_validate_batch_graphs()` | **新增** | 图存在性前置校验 |
-| `add_request()` / `update_from_output()` / `has_requests()` | **继承** | 原版逻辑不动 |
+| `add_request()` / `update_from_output()` / `has_requests()` | **不动** | 原版逻辑保持 |
 | EngineCore `process_input_sockets()`（协议扩展） | 覆盖（已有先例） | 解析 `skip_wait` / `group_hint` / `bucket` 字段 |
 
 #### 4.5.7 调用链
@@ -553,9 +563,57 @@ flowchart TD
 - 若采用逐层成图（ACS 风格）或 prefill piecewise，物理图数 = 逻辑图数 × 每图物理段数（例如 decode 逐层 = 层数+1）；
 - 终版默认**每张逻辑图一张物理图**（不做逐层拆分），图数量即 30~52，内存可预算。
 
+### 6.4 成图对接接口（给 prefill / decode 成图同事）
+
+分工：调度 / 组批 / 校验由本架构负责；**成图（warmup 捕获、静态 buffer、metadata、replay）由同事按下面接口实现**，注册进 `GraphRegistry` 即可对接，双方互不阻塞。
+
+```python
+class PrefillGraphProvider(Protocol):
+    """prefill 成图实现方需要提供的接口。"""
+
+    def warmup(self, bucket: int, batch_size: int) -> None:
+        """按长度 bucket 捕获 prefill 图（含静态输入/输出 buffer、metadata、KV 切片）。"""
+
+    def forward_prefill(self, bucket: int, input_ids, lengths, kv_slice) -> Logits:
+        """真实长度走 metadata，pad 槽位掩码；返回 logits。"""
+
+    def metadata(self, bucket: int) -> AttentionMetadata:
+        """该 bucket 的静态 attention metadata（每步拷贝真实长度）。"""
+
+
+class DecodeGraphProvider(Protocol):
+    """decode 成图实现方需要提供的接口。"""
+
+    def warmup(self, bucket: int, step: int, beam_width: int) -> None:
+        """按 (长度 bucket, step, beam_width) 捕获 decode 图。"""
+
+    def forward_decode(self, bucket: int, step: int, beam_inputs, kv_slice) -> Logits:
+        """decode 图 replay（batch-1 或按 beam 档合批）。"""
+
+    def metadata(self, bucket: int, step: int) -> AttentionMetadata:
+        """该 (bucket, step) 的静态 metadata。"""
+```
+
+`GraphRegistry` 对接：
+
+```python
+class GraphRegistry:
+    def register_prefill_provider(self, name: str, provider: PrefillGraphProvider) -> None: ...
+    def register_decode_provider(self, name: str, provider: DecodeGraphProvider) -> None: ...
+    # warmup_all() 遍历配置组合，逐个调 provider.warmup()
+    # get(bucket, step) 返回对应 provider 的图句柄；缺图抛 GraphMissingError
+```
+
+**对接约定**：
+
+1. 成图同事实现 `PrefillGraphProvider` / `DecodeGraphProvider`（各自 backend：CUDA / ACL）；
+2. 在 `initialize_runtime()` 或注册阶段调用 `registry.register_*_provider(...)`；
+3. 调度 / 组批 / 校验只与 `GraphRegistry` 交互，不感知具体 backend；
+4. 接口约束：形状由 (bucket, step, beam_width) 决定；真实长度只走 metadata（见 0.1）；warmup 全量、缺图报错。
+
 ---
 
-## 7. 与 vLLM 的接入（方案对比与插件化）
+## 7. 与 vLLM 的接入（最小改动，基于现有机制）
 
 ### 7.1 插件机制简介（先搞懂 VLLMPatch）
 
@@ -578,15 +636,15 @@ class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
 
 ### 7.2 我们需要哪些类、替换原版调度哪些函数
 
-| 我们的类（Patch） | 目标类（原版） | 替换/新增的函数 | 做什么 |
+| 改动 | 目标类（原版） | 替换/新增的函数 | 做什么 |
 |---|---|---|---|
-| `GRBatchSchedulerPatch` | `Scheduler` | 替换 `schedule()` | 消费 BatchSpec；按 (bucket, step) 分组输出；bucket 不在配置内报错；其余原版调度逻辑保留 |
-| `RequestPatch`（可选） | `Request` | 新增属性 `skip_wait` / `group_hint` / `bucket` | 协议字段透传到调度器 |
-| `KVReservePatch`（可选） | `KVCacheManager` | 新增 `reserve_bucket_slots()` | KV 池按长度 bucket 预留稳定切片 |
-| EngineCore 协议扩展 | `EngineCore` / `EngineCoreProc` | 扩展 `process_input_sockets()` / ADD_BATCH 解码 | 单/批协议（skip_wait/group_hint/bucket）进入引擎（本地已有先例） |
-| `GraphRegistry` / `GraphValidator` / `BatchAssembler` / `BucketRouter` | — | **新增模块，不替换任何原版函数** | 图注册表、bucket 校验、组批逻辑 |
+| 新增 `apply_gr_batch_scheduler_patch()` | `Scheduler` | 包装 `schedule()`（仿现有 `apply_scheduler_patch()`） | 消费 BatchSpec；按 (bucket, step) 分组输出；bucket 不在配置内报错；原版调度逻辑保留 |
+| 注册表加一项 | `vllm_gr/patch.py` | `_engine_core_beam_patches()` 加 `gr_batch_scheduler` 项 | 跟随现有 re-apply / verify 机制，子进程生效 |
+| 协议扩展（可选） | `Request` | 新增属性 `skip_wait` / `group_hint` / `lengths` / `beam_width` | 协议字段透传到调度器 |
+| EngineCore 协议扩展 | `EngineCore` / `EngineCoreProc` | 扩展 `process_input_sockets()` / ADD_BATCH 解码 | 单/批协议进入引擎（本地已有先例） |
+| `GraphRegistry` / `GraphValidator` / `BatchAssembler` / `BucketRouter` / `graph.py` | — | **新增模块，不替换任何原版函数** | 图注册表、成图 Provider 接口、bucket 校验、组批逻辑 |
 
-**最小集合（第一版）**：只替换 `Scheduler.schedule()` + 扩展 EngineCore 协议；其余都是新增模块。
+**最小集合（第一版）**：新增 `apply_gr_batch_scheduler_patch()`（包装 `schedule()`）+ 注册表加一项 + 扩展 EngineCore 协议；其余都是新增模块。
 
 > Worker 侧若需要 hook 输入准备（把真实长度写进 metadata），可参考本地已有先例替换 `ModelRunner._prepare_inputs()`（可选，第二版）。
 
@@ -613,65 +671,60 @@ setup.py 注册 vllm.general_plugins → 每个进程 load_general_plugins()
 
 **一句话**：机制等价（都是运行时替换个别方法）；我们靠 fork 自己写的 `run_engine_core` wrapper 保证子进程生效，插件靠官方每进程加载保证；插件额外提供版本守卫、按名启用、独立分发。功能上两者都能做到，引入 VLLMPatch 属于工程升级而非能力补齐。
 
-### 7.4 三种方案对比
+### 7.4 最小改动接入方案（基于现有 `apply_scheduler_patch()` 机制）
 
-| 方案 | 机制 | 适合场景 | 结论 |
-|---|---|---|---|
-| A | `SchedulerConfig.scheduler_cls` 配置注入 | fork 内/单机配置 | 作为 B 的内部手段 |
-| **B** | `vllm.general_plugins` + `VLLMPatch` | 插件化分发、跟随上游 | **采用** |
-| C | Serving 层协议插件 | 只改业务层 | 单/批解析可放这里，调度仍走 B |
+**原则**：不换调度类、不引入新框架；现有 `initialize_runtime()` → `re_apply_patches()` → `run_engine_core` wrapper 的每进程生效链路全部保留，只新增一个调度 patch。
 
-### 7.5 方案 B：插件加载时序
-
-```mermaid
-sequenceDiagram
-    participant VP as vLLM 启动
-    participant PL as general_plugins
-    participant EC as EngineCore 子进程
-    participant SC as GRBatchScheduler
-
-    VP->>PL: load_general_plugins()（每个进程）
-    PL->>PL: 发现 vllm.general_plugins entry point
-    PL->>PL: register_patches() → manager.register('GRBatchScheduler', Patch)
-    PL->>SC: 配置 scheduler_cls / 或 patch schedule()
-    Note over EC: 之后才创建 Scheduler / 加载模型
-    EC->>SC: 实例化 GRBatchScheduler
-```
-
-**真实注册写法（对齐博客原文，`manager.register(name, PatchClass)`）**：
+**改动点 1：`engine_core_patch.py` 新增 `apply_gr_batch_scheduler_patch()`**
 
 ```python
-# patches/gr_scheduler.py —— patch 定义为 VLLMPatch 子类
-from vllm_gr.scheduling.core import VLLMPatch, min_vllm_version
+_GR_BATCH_SCHEDULER_MARKER = "_vllm_gr_gr_batch_scheduler_patch"
 
-class GRBatchSchedulerPatch(VLLMPatch[Scheduler]):
-    @min_vllm_version("0.8.0")          # 版本守卫
-    def apply(self, target_cls):
-        target_cls.schedule = gr_schedule   # 外科手术式替换 schedule
+def apply_gr_batch_scheduler_patch():
+    """仿照 apply_scheduler_patch()：包装 Scheduler.schedule，消费 BatchSpec。"""
+    from vllm.v1.core.sched.scheduler import Scheduler
+    if getattr(Scheduler.schedule, _GR_BATCH_SCHEDULER_MARKER, False):
+        return
+    _original_schedule = Scheduler.schedule
 
+    @wraps(_original_schedule)
+    def patched_schedule(self):
+        self._drain_batch_queue()          # 消费 BatchSpec → 请求入队
+        self._validate_batch_graphs()      # bucket 图存在性校验，缺图报错
+        output = _original_schedule(self)  # 原版调度逻辑
+        output.batch_grouping = self._group_by_bucket(output)  # 附加分组
+        return output
 
-# plugin.py —— entry point 指向的函数
-def register_patches():
-    manager.register('GRBatchScheduler', GRBatchSchedulerPatch)
-    manager.apply_from_env()            # 按环境变量启用（如 VLLM_CUSTOM_PATCHES）
+    Scheduler.schedule = patched_schedule
+    setattr(Scheduler.schedule, _GR_BATCH_SCHEDULER_MARKER, True)
 ```
+
+**改动点 2：注册表加一项（`patch.py` 的 `_engine_core_beam_patches()`）**
 
 ```python
-# setup.py —— 注册 vllm.general_plugins entry point
-entry_points={
-    'vllm.general_plugins': [
-        'vllm_gr_sched = vllm_gr.scheduling.plugin:register_patches'
-    ],
-}
+patch(
+    "gr_batch_scheduler",
+    "vllm_gr.scheduling.scheduler_patch",
+    "apply_gr_batch_scheduler_patch",
+    _validate_gr_batch_scheduler_patch,
+),
 ```
 
-> 注意：博客里的 `VLLMPatch` / `PatchManager` / `VLLM_CUSTOM_PATCHES` 是**作者自建的小框架**（博客原文也注明 `VLLM_CUSTOM_PATCHES` 不是官方环境变量）；vLLM 官方的契约只有 `vllm.general_plugins` entry point 指向注册函数。我们落地时可以用自己的 `VLLMPatch` 实现，或直接复用博客框架。
+这样它会自动跟随现有 `re_apply_patches()` / `run_engine_core` wrapper 链路，在 EngineCore 子进程生效，并带 verify 校验。
 
-### 7.6 推荐组合
+**改动点 3：协议字段进入 EngineCore**
 
-- **调度注入**：插件内按博客方式注册 `GRBatchSchedulerPatch`（`manager.register('GRBatchScheduler', ...)`）；需要显式换类时再设置 `scheduler_cls="vllm_gr.scheduling.GRBatchScheduler"`；
-- **协议扩展**：单/批解析在 Serving 层（方案 C 的思想），协议字段进入 EngineCore；
-- **不做**：传统 monkey patch。
+- `BatchSpec`（含 `lengths` / 统一 `beam_width` / `skip_wait` / `group_hint`）通过扩展 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE` 传入（本地已有协议扩展先例）。
+
+**改动点 4：GraphRegistry + Provider 注册（见 6.4）**
+
+- 成图同事实现 Provider 并注册；调度侧只依赖 `GraphRegistry`。
+
+**不需要做的事**：
+
+- ❌ 不用 `SchedulerConfig.scheduler_cls` 换类（patch 方式即可）；
+- ❌ 不用引入 VLLMPatch / 新插件框架（现有 general_plugins 入口已具备每进程加载）；
+- ❌ 不用改分发方式（现有 `vllm_gr.plugin:register` 已注册）。
 
 ---
 
@@ -679,14 +732,14 @@ entry_points={
 
 | 参数 | 默认 | 我们的用法 | 说明 |
 |---|---|---|---|
-| `scheduler_cls` | `Scheduler` | `vllm_gr.scheduling.GRBatchScheduler` | 自定义调度器注入点 |
+| `scheduler_cls` | `Scheduler` | **不使用**（沿用 patch 方式） | 不换类，只包装 `schedule()` |
 | `policy` | `fcfs` | `fcfs` | 与 FIFO 一致，不改 |
 | `max_num_seqs` | 128 | 固定 batch 容量（如 8） | 每步最多序列数 |
 | `max_num_batched_tokens` | 2048 | 按真实长度预算 | 图级 padding 不占预算 |
 | `enable_chunked_prefill` | True | 保持默认或按 bucket 关闭 | 与固定长度图冲突时关闭 |
 | `scheduler_reserve_full_isl` | True | 保持 | 准入前检查全长 KV 放得下 |
 | `watermark` | 0.0 | 按需 | KV 余量 |
-| `async_scheduling` | None | 不启用 | 自定义 Scheduler 会禁用 async，接受 |
+| `async_scheduling` | None | 保持原样 | patch 不改类，不影响 async 配置 |
 
 ---
 
@@ -694,7 +747,6 @@ entry_points={
 
 ```yaml
 scheduler_plugin:
-  scheduler_cls: "vllm_gr.scheduling.GRBatchScheduler"
   admission_mode: auto            # auto | single_only | grouped_only
   batch_size: 8
   length_buckets: [512, 1024, 2048]
@@ -704,16 +756,17 @@ scheduler_plugin:
   graph_missing: error
 ```
 
+> 约束：同一 BatchSpec 内 `beam_width` 必须一致（组批混 beam 宽会被拒绝；FIFO 按 (bucket, beam_width) 分队列攒批）。
+
 ---
 
 ## 10. 实施步骤
 
-1. **协议层**：扩展 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE`，增加 `skip_wait` / `group_hint` / `bucket`；Serving 层实现 adapter/router/assembler；
-2. **插件骨架**：`vllm.general_plugins` entry point + `register_patches()` + `VLLMPatch[Scheduler]`；
-3. **调度器**：`GRBatchScheduler(Scheduler)`，FIFO 攒批、超时发车、组批直发、缺图报错；
-4. **图校验**：GraphValidator + GraphRegistry（warmup 全量捕获）打通；
-5. **混合压测**：单/批混合负载，验证图命中率 100%、padding 记账、FTT/TBT、图数量 30~52 内存预算；
-6. **插件分发验证**：`pip install` vLLM + 插件包，脱离 fork 跑通。
+1. **数据契约**：`BatchSpec`（含 `lengths` / 统一 `beam_width`）与协议字段（`skip_wait` / `group_hint`）；
+2. **调度 patch**：`engine_core_patch.py` 新增 `apply_gr_batch_scheduler_patch()`，`_engine_core_beam_patches()` 注册表加一项；
+3. **成图接口**：`graph.py` 定义 `PrefillGraphProvider` / `DecodeGraphProvider`，`GraphRegistry` 支持注册与 warmup；
+4. **单/批双路径**：adapter/router/assembler 落地，FIFO 按 (bucket, beam_width) 攒批、组批直发；
+5. **混合压测**：单/批混合负载，验证图命中率 100%、padding 记账、FTT/TBT、图数量 30~52 内存预算。
 
 ---
 
@@ -721,10 +774,10 @@ scheduler_plugin:
 
 | 风险 | 对策 |
 |---|---|
-| `scheduler_cls` 接口非公开、升级不兼容 | 版本守卫（`@min_vllm_version`）；薄适配层 |
-| 自定义 Scheduler 禁用 async scheduling | 压测对比；不达标再评估 AsyncScheduler 子类化 |
-| general_plugins 每进程加载依赖 entry point 注册 | 插件包安装正确性纳入 CI |
+| 包装 `schedule()` 与上游签名不兼容 | 复用现有 marker + verify 机制；升级时只改适配层 |
 | 单/批协议解析分散 | 统一到 `vllm_gr/scheduling/adapter.py` |
+| 组批 beam width 混批 | BatchAssembler / Validator 校验：不一致拒绝该组 |
+| 成图 Provider 未注册或缺图 | GraphRegistry 启动校验；`graph_missing: error` |
 | 组批与 FIFO 混排复杂 | 终版规则：组批不进队列；合并后置 |
 | bucket 配置与流量不匹配 | GraphValidator 前置报错 + 上线前统计配置 |
 | 图数量超内存预算 | 按 0.2 公式启动预检；物理图拆分时乘段数 |
@@ -733,4 +786,4 @@ scheduler_plugin:
 
 ## 附录：一句话总结
 
-**单请求走 FIFO 攒批、组批走 skip_wait 直发，在 BatchSpec 处汇合；padding 发生在 worker 图输入准备（长度走 metadata）；图数量 30~52 可预算、warmup 全量捕获、缺图报错；调度器通过 general_plugins + scheduler_cls 接入 vLLM，输入方式不同，执行链完全共用。**
+**单请求走 FIFO 攒批、组批走 skip_wait 直发，在 BatchSpec（带每个请求长度、批内统一 beam_width）处汇合；padding 发生在 worker 图输入准备（长度走 metadata）；图数量 30~52 可预算、warmup 全量捕获、缺图报错；接入采用最小改动——在现有 `apply_scheduler_patch()` 机制上新增一个调度 patch，成图同事按 Provider 接口对接，输入方式不同，执行链完全共用。**

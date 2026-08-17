@@ -564,7 +564,7 @@ flowchart TD
 - 终版默认**每张逻辑图一张物理图**（不做逐层拆分），图数量即 30~52，内存可预算。
 
 ### 6.4 成图接口
-分工：调度 / 组批 / 校验由本架构负责；**成图（warmup 捕获、静态 buffer、metadata、replay）由同事按下面接口实现**，注册进 `GraphRegistry` 即可对接，双方互不阻塞。
+分工：调度 / 组批 / 校验由本架构负责；**成图（warmup 捕获、静态 buffer、metadata、replay）接口**，注册进 `GraphRegistry` 即可对接，双方互不阻塞。
 
 ```python
 class PrefillGraphProvider(Protocol):
@@ -605,7 +605,7 @@ class GraphRegistry:
 
 **对接约定**：
 
-1. 成图同事实现 `PrefillGraphProvider` / `DecodeGraphProvider`（各自 backend：CUDA / ACL）；
+1. 实现 `PrefillGraphProvider` / `DecodeGraphProvider`（各自 backend：CUDA / ACL）；
 2. 在 `initialize_runtime()` 或注册阶段调用 `registry.register_*_provider(...)`；
 3. 调度 / 组批 / 校验只与 `GraphRegistry` 交互，不感知具体 backend；
 4. 接口约束：形状由 (bucket, step, beam_width) 决定；真实长度只走 metadata（见 0.1）；warmup 全量、缺图报错。

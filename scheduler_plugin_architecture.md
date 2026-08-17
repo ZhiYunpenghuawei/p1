@@ -26,7 +26,7 @@
 ```mermaid
 flowchart LR
     R[请求 900 token] -->|bucket=1024 标记| S[调度器<br>预算按 900 计]
-    S --> W1[Worker 输入准备<br>900 拷入 1024 形状静态 buffer<br>metadata: seq_lens=[900...]]
+    S --> W1["Worker 输入准备<br>900 拷入 1024 形状静态 buffer<br>metadata: seq_lens=[900...]"]
     W1 --> W2[图 replay 8×1024<br>pad 槽位被掩码]
     W2 --> O[输出切回真实部分]
 ```

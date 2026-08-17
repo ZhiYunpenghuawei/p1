@@ -563,8 +563,7 @@ flowchart TD
 - 若采用逐层成图（ACS 风格）或 prefill piecewise，物理图数 = 逻辑图数 × 每图物理段数（例如 decode 逐层 = 层数+1）；
 - 终版默认**每张逻辑图一张物理图**（不做逐层拆分），图数量即 30~52，内存可预算。
 
-### 6.4 成图对接接口（给 prefill / decode 成图同事）
-
+### 6.4 成图接口
 分工：调度 / 组批 / 校验由本架构负责；**成图（warmup 捕获、静态 buffer、metadata、replay）由同事按下面接口实现**，注册进 `GraphRegistry` 即可对接，双方互不阻塞。
 
 ```python
@@ -613,7 +612,7 @@ class GraphRegistry:
 
 ---
 
-## 7. 与 vLLM 的接入（最小改动，基于现有机制）
+## 7.  vLLM 的接入
 
 ### 7.1 插件机制简介（先搞懂 VLLMPatch）
 
@@ -634,7 +633,7 @@ class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
 
 **回答你的问题**：对，`class XxxPatch(VLLMPatch[Scheduler])` 里只写要改的方法，`apply()` 里只给目标类换掉/新增那一个方法——这就是“单个方法替换，不复制整个类”。
 
-### 7.2 我们需要哪些类、替换原版调度哪些函数
+### 7.2 替换原版调度函数
 
 | 改动 | 目标类（原版） | 替换/新增的函数 | 做什么 |
 |---|---|---|---|

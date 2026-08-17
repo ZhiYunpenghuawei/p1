@@ -1,5 +1,7 @@
-# vllm-gr 调度设计
+# vllm-gr 调度设计（纯设计版）
 
+> 状态：设计定稿
+> 说明：本文档只描述我们自己的调度设计，不含 NVIDIA / ACS 等外部参考内容；实现基线以本文为准。
 > 关联：现有调度 patch 机制见 `vllm_gr/v1/engine/engine_core_patch.py`（`apply_scheduler_patch` 模式）。
 
 ---
@@ -9,7 +11,7 @@
 1. **图固定**：warmup 全量捕获，运行时不捕获、不缓存、不 eager 回退，**缺图报错**；
 2. **长度用 bucket**：长度档位与数量由用户配置；
 3. **batch 多级，不固定单一档**：8 常态、4 降级（见第 2 节）；
-4. **双路径**：单请求 FIFO 攒批 / 业务方组批直发（`skip_wait`），可用 `assume_grouped` 默认全组批；
+4. **双路径（两种模式）**：默认组 batch 模式（单请求 FIFO、batch 可 `skip_wait` 直发）；`assume_grouped=true` 时全部直发、不等待；
 5. **beam 按档**：beam width 动态，配置档位（如 128/256），批内统一；
 6. **padding 时机**：worker 图输入准备阶段，长度走 metadata；
 7. **接入方式**：沿用现有 `apply_scheduler_patch()` 机制，不改类、不引入新插件框架。
@@ -92,10 +94,11 @@ decode 图 = S × W × B × L = 3 × 2 × 2 × 3 = 36
 | 输入 | 判定 | 路径 |
 |---|---|---|
 | 普通请求（无 `skip_wait`） | 默认 | FIFO 攒批 |
-| 组批请求（带 `skip_wait`） | bucket 校验通过 | 直发 |
-| 组批请求 | bucket 校验失败 | 报错拒绝 |
+| batch 请求（带 `skip_wait`） | bucket 校验通过 | 直发：自动归 bucket，按多级规则选档（6 → 8） |
+| batch 请求（不带 `skip_wait`） | 默认 | 与单请求一样进 FIFO |
+| batch 请求（带 `skip_wait`） | bucket 校验失败 | 报错拒绝 |
 
-> `assume_grouped=true` 时，普通请求也默认视为组批，直接走直发路径。
+> `assume_grouped=true` 时，**所有请求（含单条）全部直接转，不等待**。
 
 ### 3.2 决策流程
 
@@ -116,16 +119,17 @@ flowchart TD
 
 > `assume_grouped=true` 时跳过 FIFO 分支，全部走组批直发。
 
-### 3.3 配置
+### 3.3 配置（两种模式）
 
 ```yaml
-admission_mode: auto        # auto | single_only | grouped_only
-assume_grouped: false       # true：默认全部按业务方组批，不走 FIFO
+assume_grouped: false       # false（默认）：组 batch 模式；true：全部直发不等待
 ```
 
-- `auto`：两种都支持（默认）；
-- `single_only`：组批请求按普通请求处理（进队列）；
-- `grouped_only` / `assume_grouped=true`：全部直发。
+- **`assume_grouped: false`（默认，组 batch 模式）**：
+  - 单请求 → FIFO 攒批（满 8 发车，超时按 n 降级发 4/8）；
+  - batch 带 `skip_wait` → 直发：自动归 bucket，按多级规则选档（1–4 → 4，5–8 → 8，6 个 → 8）；
+  - batch 不带 `skip_wait` → 与单请求一样进 FIFO；
+- **`assume_grouped: true`（全部直转）**：所有请求（含单条）直接发车，不等待；同样自动归 bucket 选档。
 
 ---
 
@@ -180,7 +184,7 @@ class BucketRouter:
 class BatchAssembler:
     def __init__(self, batch_buckets=(4, 8), normal_bucket=8,
                  degraded_bucket=4, max_wait_ms=10.0,
-                 admission_mode="auto", assume_grouped=False): ...
+                 assume_grouped=False): ...
 
     def enqueue(self, req, bucket: int) -> None:
         """单请求进 FIFO（按 bucket × beam_width 分队列）。"""
@@ -354,7 +358,6 @@ stateDiagram-v2
 
 ```yaml
 scheduler_plugin:
-  admission_mode: auto        # auto | single_only | grouped_only
   assume_grouped: false       # true：默认全部按业务方组批
   batch_buckets: [4, 8]       # 多级 batch：8 常态、4 降级
   normal_bucket: 8
@@ -381,7 +384,7 @@ scheduler_plugin:
 
 ---
 
-## 9. 风险与对策
+## 9. 风险与对策（仅我们的）
 
 | 风险 | 对策 |
 |---|---|

@@ -8,7 +8,7 @@
 
 ---
 
-## 0. 两个前置问题
+## 0. 两个前置结论（先定死的设计决策）
 
 > 这两个结论来自方案讨论，后续所有架构都建立在其上，不再反复权衡。
 
@@ -423,7 +423,65 @@ flowchart TD
 
 ## 7. 与 vLLM 的接入（方案对比与插件化）
 
-### 7.1 三种方案
+### 7.1 插件机制简介（先搞懂 VLLMPatch）
+
+**vLLM 官方的契约只有一个**：`vllm.general_plugins` entry point。插件包在 `setup.py` 里注册这个 entry point，vLLM 在**每个进程**（main / EngineCore / worker）启动早期自动调用指向的注册函数。
+
+**VLLMPatch 是博客在其上自建的小框架**，核心思想是“外科手术式替换”：
+
+```python
+class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
+    @min_vllm_version("0.8.0")
+    def apply(self, target_cls):
+        target_cls.schedule = priority_schedule   # 只替换这一个方法
+```
+
+- **只实现某个方法 → 就只替换这一个方法**，目标类（`Scheduler`）的其他方法原样保留；
+- 不复制整个类、不复制整文件，只有修改部分；
+- 通过 `manager.register('PriorityScheduler', PrioritySchedulerPatch)` 注册，`manager.apply_from_env()` 按环境变量选择性启用。
+
+**回答你的问题**：对，`class XxxPatch(VLLMPatch[Scheduler])` 里只写要改的方法，`apply()` 里只给目标类换掉/新增那一个方法——这就是“单个方法替换，不复制整个类”。
+
+### 7.2 我们需要哪些类、替换原版调度哪些函数
+
+| 我们的类（Patch） | 目标类（原版） | 替换/新增的函数 | 做什么 |
+|---|---|---|---|
+| `GRBatchSchedulerPatch` | `Scheduler` | 替换 `schedule()` | 消费 BatchSpec；按 (bucket, step) 分组输出；bucket 不在配置内报错；其余原版调度逻辑保留 |
+| `RequestPatch`（可选） | `Request` | 新增属性 `skip_wait` / `group_hint` / `bucket` | 协议字段透传到调度器 |
+| `KVReservePatch`（可选） | `KVCacheManager` | 新增 `reserve_bucket_slots()` | KV 池按长度 bucket 预留稳定切片 |
+| EngineCore 协议扩展 | `EngineCore` / `EngineCoreProc` | 扩展 `process_input_sockets()` / ADD_BATCH 解码 | 单/批协议（skip_wait/group_hint/bucket）进入引擎（本地已有先例） |
+| `GraphRegistry` / `GraphValidator` / `BatchAssembler` / `BucketRouter` | — | **新增模块，不替换任何原版函数** | 图注册表、bucket 校验、组批逻辑 |
+
+**最小集合（第一版）**：只替换 `Scheduler.schedule()` + 扩展 EngineCore 协议；其余都是新增模块。
+
+> Worker 侧若需要 hook 输入准备（把真实长度写进 metadata），可参考本地已有先例替换 `ModelRunner._prepare_inputs()`（可选，第二版）。
+
+### 7.3 我们现在的 monkey patch 与插件系统：一样吗？区别？
+
+**相同点**：原理完全一样——都是运行时替换类的个别方法，不复制整个类。我们本地 `engine_core_patch.py` 就是这么干的：
+
+```python
+_original_schedule = Scheduler.schedule          # 保存原方法
+...
+def patched_schedule(self): ...                  # 包装
+...
+Scheduler.schedule = patched_schedule            # 重新赋值
+```
+
+**区别**：
+
+| 维度 | 我们现在的 monkey patch（patch.py / engine_core_patch.py） | vLLM general_plugins（VLLMPatch） |
+|---|---|---|
+| 加载时机 | 主进程 import 时执行 | **每个进程**（含 EngineCore / worker）启动早期自动调用 |
+| EngineCore 子进程生效 | 不一定（Scheduler 跑在子进程，monkey patch 常失效） | 保证生效 |
+| 版本管理 | 无，升级 vLLM 靠手工同步 | `@min_vllm_version` 版本守卫 |
+| 选择性启用 | 无，启动即全部打上 | 环境变量按 patch 名启用 |
+| 官方支持 | 无（黑盒绕开 API） | `vllm.general_plugins` 是官方扩展点 |
+| 分发 | fork 内散落 | pip 插件包独立分发 |
+
+**结论与建议**：我们现在是“fork 内的 monkey patch”，和插件系统机制相同、但缺了“子进程加载 + 版本管理 + 独立分发”三件事。建议把 `patch.py` 里**调度相关的 patch**（`Scheduler.schedule` 等）逐步收拢成 `vllm.general_plugins` 包，用 `VLLMPatch` 写法重写，其它模型/推理 patch 可以继续留在 fork 内。
+
+### 7.4 三种方案对比
 
 | 方案 | 机制 | 适合场景 | 结论 |
 |---|---|---|---|
@@ -431,7 +489,7 @@ flowchart TD
 | **B** | `vllm.general_plugins` + `VLLMPatch` | 插件化分发、跟随上游 | **采用** |
 | C | Serving 层协议插件 | 只改业务层 | 单/批解析可放这里，调度仍走 B |
 
-### 7.2 方案 B：插件加载时序
+### 7.5 方案 B：插件加载时序
 
 ```mermaid
 sequenceDiagram
@@ -442,15 +500,44 @@ sequenceDiagram
 
     VP->>PL: load_general_plugins()（每个进程）
     PL->>PL: 发现 vllm.general_plugins entry point
-    PL->>PL: register_patches() → VLLMPatch[Scheduler]
+    PL->>PL: register_patches() → manager.register('GRBatchScheduler', Patch)
     PL->>SC: 配置 scheduler_cls / 或 patch schedule()
     Note over EC: 之后才创建 Scheduler / 加载模型
     EC->>SC: 实例化 GRBatchScheduler
 ```
 
-### 7.3 推荐组合
+**真实注册写法（对齐博客原文，`manager.register(name, PatchClass)`）**：
 
-- **调度注入**：方案 B 的插件内设置 `scheduler_cls="vllm_gr.scheduling.GRBatchScheduler"`（或 `VLLMPatch[Scheduler].replace_method("schedule", ...)`）；
+```python
+# patches/gr_scheduler.py —— patch 定义为 VLLMPatch 子类
+from vllm_gr.scheduling.core import VLLMPatch, min_vllm_version
+
+class GRBatchSchedulerPatch(VLLMPatch[Scheduler]):
+    @min_vllm_version("0.8.0")          # 版本守卫
+    def apply(self, target_cls):
+        target_cls.schedule = gr_schedule   # 外科手术式替换 schedule
+
+
+# plugin.py —— entry point 指向的函数
+def register_patches():
+    manager.register('GRBatchScheduler', GRBatchSchedulerPatch)
+    manager.apply_from_env()            # 按环境变量启用（如 VLLM_CUSTOM_PATCHES）
+```
+
+```python
+# setup.py —— 注册 vllm.general_plugins entry point
+entry_points={
+    'vllm.general_plugins': [
+        'vllm_gr_sched = vllm_gr.scheduling.plugin:register_patches'
+    ],
+}
+```
+
+> 注意：博客里的 `VLLMPatch` / `PatchManager` / `VLLM_CUSTOM_PATCHES` 是**作者自建的小框架**（博客原文也注明 `VLLM_CUSTOM_PATCHES` 不是官方环境变量）；vLLM 官方的契约只有 `vllm.general_plugins` entry point 指向注册函数。我们落地时可以用自己的 `VLLMPatch` 实现，或直接复用博客框架。
+
+### 7.6 推荐组合
+
+- **调度注入**：插件内按博客方式注册 `GRBatchSchedulerPatch`（`manager.register('GRBatchScheduler', ...)`）；需要显式换类时再设置 `scheduler_cls="vllm_gr.scheduling.GRBatchScheduler"`；
 - **协议扩展**：单/批解析在 Serving 层（方案 C 的思想），协议字段进入 EngineCore；
 - **不做**：传统 monkey patch。
 

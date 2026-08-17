@@ -1,7 +1,5 @@
-# vllm-gr 调度设计（纯设计版）
+# vllm-gr 调度设计
 
-> 状态：设计定稿
-> 说明：本文档只描述我们自己的调度设计，不含 NVIDIA / ACS 等外部参考内容；实现基线以本文为准。
 > 关联：现有调度 patch 机制见 `vllm_gr/v1/engine/engine_core_patch.py`（`apply_scheduler_patch` 模式）。
 
 ---

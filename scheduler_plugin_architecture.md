@@ -79,6 +79,37 @@ flowchart LR
 
 > 注：若采用逐层成图（ACS 风格）或 prefill piecewise，每张“逻辑图”会拆成多张物理图，实际数量 = 逻辑图数 × 每图物理段数。
 
+### 0.3 不同长度输入：NVIDIA 与 ACS 的做法（附源码位置）
+
+场景：固定图 8×1024，实际来 5 个请求，长度 `[900, 900, 900, 1000, 1000]`。
+
+**NVIDIA（GPU）：长度不同 → 分图，不在一张图里混**
+
+- 调度按 `(step, beam_width, next_beam_width, context_len)` 分组，`context_len` 不同的请求进不同 microbatch（[`_plan_decode_batches`](/tmp/nvidia_continuous.py:547)）；
+- 图路径强校验：同一 microbatch 内所有请求的 `context_len` 必须一致（[`_context_pool_view_for_states`](/tmp/nvidia_continuous.py:2443)，`len(context_lens) != 1 → return None`）——900 和 1000 **不会进同一张 decode 图**；
+- batch 维不足 8 时用 `_padded_tensor_batch` 补空行，空行靠 `item_mask` 掩掉、不产生有效输出（[`_decode_cuda_graph_inputs`](/tmp/nvidia_continuous.py:2335)）；
+- prefill 同理：按 `input_ids.shape` 分组，同形状才合批（[`_run_prefill`](/tmp/nvidia_continuous.py:1491)）；
+- decode 图 key 含 `context_len` 与 KV shape（[`decode_cuda_graph.py::_key`](/tmp/nvidia_decode_cuda_graph.py:401)）。
+
+**ACS（NPU）：固定形状图内支持每行不同长度（metadata 驱动）**
+
+- 图按（bs 取 2 的幂 × 长度挡位）固定形状预捕获：5 个请求行数 5 → bs 取 8 档，长度 900/1000 ≤ 1024 → 用 1024 档；
+- 运行时把真实 `query_lens` / `query_start_loc` / `max_query_len` 拷进静态 metadata（[`_copy_replay_data`](/tmp/vllm-ACS/vllm-ascend/vllm_ascend/models/hstu/hstu.py:828)），静态 metadata 本身带 `seq_lens` / `seq_lens_list` / `slot_mapping`（[`_build_metadata_by_bs_and_num_token`](/tmp/vllm-ACS/vllm-ascend/vllm_ascend/models/hstu/hstu.py:838)）；
+- kernel 按每行真实长度处理，空行不参与——**900 和 1000 可以在同一张 8×1024 图里跑**，长度是数据不是形状；
+- 运行时选档 + replay 入口见 [`forward_aclgraph`](/tmp/vllm-ACS/vllm-ascend/vllm_ascend/models/hstu/hstu.py:577)，全形状预捕获入口见 [`capture_model`](/tmp/vllm-ACS/vllm-ascend/vllm_ascend/models/hstu/hstu.py:1038)。
+
+**对比结论**：
+
+| 维度 | NVIDIA（GPU） | ACS（NPU） |
+|---|---|---|
+| 900/1000 能否同图 | ❌ 分图 | ✅ 同图（metadata 变长） |
+| 机制 | 分组键含 context_len + 池视图强校验 | 固定形状图 + 每步拷真实长度 |
+| batch 空行 | padding + `item_mask` | bs 向上取 2 的幂，空行不参与 |
+| prefill | 按 `input_ids.shape` 分组 | 按 seq 挡位分档 |
+| 源码 | continuous.py L547/L1491/L2335/L2443、decode_cuda_graph.py L401 | hstu.py L577/L828/L838/L1038 |
+
+**对我们的含义**：我们的 kernel 若支持“每行真实长度走 metadata”（ACS 已在 NPU 验证可行），900/1000 就能同图、图数量不随长度档膨胀；若像 NVIDIA 一样要求长度一致，则按长度分图（decode 图数 ×L，见 0.2）。
+
 ---
 
 ## 1. 背景与目标

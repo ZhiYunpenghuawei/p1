@@ -318,6 +318,140 @@ JSON 示例（组批）：
 }
 ```
 
+### 4.5 接口定义（详细）
+
+> 本节给出每个类需要实现的函数签名与行为约束，是实现的第一手规格。
+
+#### 4.5.1 RequestAdapter（协议层：单/批区分）
+
+```python
+class RequestAdapter:
+    """把原始请求解析成 admission 类型，透传协议字段。"""
+
+    def parse(self, req) -> Admission:
+        """返回 Admission.SINGLE 或 Admission.GROUPED。
+        判定依据：请求是否携带 skip_wait / group_hint。"""
+
+    def is_grouped(self, req) -> bool: ...
+    def extract_group_hint(self, req) -> str | None: ...
+    def extract_beam_width(self, req) -> int:
+        """每个请求的 beam_width，用于 beam 展开信息。"""
+```
+
+#### 4.5.2 BucketRouter（长度/beam 归桶）
+
+```python
+@dataclass(frozen=True)
+class BucketInfo:
+    length_bucket: int
+    beam_bucket: int
+    graph_keys: tuple[str, ...]      # 如 ("prefill:1024", "decode:step1:1024", ...)
+
+class BucketRouter:
+    def __init__(self, length_buckets: tuple[int, ...],
+                 beam_buckets: tuple[int, ...]) -> None: ...
+
+    def resolve_length_bucket(self, length: int) -> int:
+        """返回第一个 ≥ length 的档位；无档可归时抛 ConfigError。"""
+
+    def resolve_beam_bucket(self, beam_width: int) -> int:
+        """返回第一个 ≥ beam_width 的档位；无档可归时抛 ConfigError。"""
+
+    def route(self, req) -> BucketInfo:
+        """组合 length + beam 归桶，并生成图 key 列表。"""
+```
+
+#### 4.5.3 BatchAssembler（FIFO 攒批 / 组批直发）
+
+```python
+class BatchAssembler:
+    def __init__(self, batch_size: int, max_wait_ms: float,
+                 admission_mode: str = "auto") -> None: ...
+
+    def enqueue(self, req, bucket: int) -> None:
+        """单请求进入对应 bucket 的 FIFO 队列。"""
+
+    def dispatch_group(self, group, bucket: int) -> BatchSpec:
+        """组批直发：不进队列，直接生成 BatchSpec（skip_wait=True）。"""
+
+    def next_batch(self, now: float) -> BatchSpec | None:
+        """攒满 batch_size 或超时 → 生成 BatchSpec；否则 None。"""
+
+    def on_tick(self, now: float) -> None:
+        """周期检查各队列超时，触发强制发车。"""
+
+    def stats(self) -> dict:
+        """队列长度 / 等待时间 / padding 记账。"""
+```
+
+#### 4.5.4 GraphValidator / GraphRegistry（图检查与查询）
+
+```python
+class GraphValidator:
+    def validate(self, spec: BatchSpec) -> bool:
+        """bucket 在配置内且图存在。"""
+
+    def ensure_configured(self, bucket: int) -> None:
+        """bucket 不在配置内 → 抛 GraphConfigError（缺图报错）。"""
+
+class GraphRegistry:
+    def warmup_all(self, cfg) -> None:
+        """启动时按 (长度 bucket × step × beam 档) 全量捕获。"""
+
+    def has(self, bucket: int, step: int) -> bool: ...
+    def get(self, bucket: int, step: int) -> Graph:
+        """缺图抛 GraphMissingError。"""
+
+    def static_input(self, bucket: int) -> Tensor: ...
+    def static_metadata(self, bucket: int) -> AttentionMetadata: ...
+    def kv_slice(self, bucket: int) -> KVSlice: ...
+```
+
+#### 4.5.5 GRBatchScheduler（核心：继承 vLLM Scheduler）
+
+```python
+class GRBatchScheduler(Scheduler):
+    """替换原版 Scheduler，消费 BatchSpec 并保持原版连续调度语义。"""
+
+    def __init__(self, *args, batch_queue=None, config=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batch_queue = batch_queue      # BatchSpec 队列（由插件/引擎填充）
+        self.gr_config = config
+
+    def schedule(self) -> SchedulerOutput:
+        """唯一必须覆盖的函数。流程：
+        1. 先消费 batch_queue 里的 BatchSpec，把请求放入 running/waiting；
+        2. 调用父类 schedule()（原版 token 预算 / KV 分配逻辑不变）；
+        3. 输出前附加 bucket 分组信息（复用现有 beam_data 机制）。"""
+
+    def consume_batch(self, spec: BatchSpec) -> None:
+        """新增：BatchSpec 进入调度器（由引擎/插件调用）。"""
+
+    def _validate_batch_graphs(self, spec: BatchSpec) -> None:
+        """新增：发车前 GraphValidator 校验，缺图抛错。"""
+
+    # 以下全部继承原版，不覆盖：
+    # add_request() / update_from_output() / has_requests() / free_finished_request() ...
+```
+
+#### 4.5.6 覆盖 vs 新增 vs 继承
+
+| 函数 | 类型 | 说明 |
+|---|---|---|
+| `schedule()` | **覆盖** | 消费 BatchSpec → 调父类 → 附加 bucket 分组 |
+| `consume_batch()` | **新增** | BatchSpec 入队入口 |
+| `_validate_batch_graphs()` | **新增** | 图存在性前置校验 |
+| `add_request()` / `update_from_output()` / `has_requests()` | **继承** | 原版逻辑不动 |
+| EngineCore `process_input_sockets()`（协议扩展） | 覆盖（已有先例） | 解析 `skip_wait` / `group_hint` / `bucket` 字段 |
+
+#### 4.5.7 调用链
+
+```text
+请求 → RequestAdapter.parse → BucketRouter.route → BatchAssembler
+  → GraphValidator.validate → BatchSpec → GRBatchScheduler.consume_batch
+  → GRBatchScheduler.schedule() → SchedulerOutput → Worker 图执行
+```
+
 ---
 
 ## 5. 关键流程
@@ -458,188 +592,26 @@ class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
 
 ### 7.3 我们现在的 monkey patch 与插件系统：一样吗？区别？
 
-#### 7.3.1 我们 fork 的 monkey patch：源码与逻辑
+**结论：两种方式最后都能实现，差别只在“谁保证每进程生效、怎么分发升级”。**
 
-**核心逻辑**：保存原方法 → 包装 → 重新赋值 → 打标记防重复 → 在子进程入口重新应用。
-
-源码证据（`vllm_gr/v1/engine/engine_core_patch.py`）：
-
-```python
-# ① 保存原方法，包装后重新赋值（Scheduler.schedule）
-_original_schedule = Scheduler.schedule
-
-@wraps(_original_schedule)
-def patched_schedule(self):
-    ...
-    output = _original_schedule(self)          # 先调原版
-    output.beam_data = build_beam_request_metadata(...)  # 再附加 beam 信息
-    return output
-
-Scheduler.schedule = patched_schedule          # 重新赋值
-setattr(Scheduler.schedule, _SCHEDULER_PATCH_MARKER, True)  # 标记防重复
-```
-
-```python
-# ② 子进程入口 wrapper：spawn 出的 EngineCore 子进程里模块全新，
-#    Scheduler 是原版，所以必须在子进程启动时重新打一遍 patch
-def run_engine_core(*args, **kwargs):
-    """...In the spawned child process, all modules are freshly imported, so
-    EngineCoreProc.run_engine_core is the original unpatched version.
-    We apply our patches first, then delegate to the original."""
-    apply_engine_core_child_patches()   # 请求 patch + 调度 patch + worker patch
-    return original_run(*args, **kwargs)
-```
-
-```python
-# ③ 集中注册表 + 校验（vllm_gr/patch.py）
-def _required_beam_patches():
-    return (
-        BeamPatch(name="flat_logprobs", apply=..., verify=_validate_flat_logprobs_patch),
-        BeamPatch(name="batch_and_fork", apply=..., verify=_validate_batch_and_fork_patch),
-        ...
-    )
-_initialize_beam_patch_plan(_required_beam_patches())   # 逐个 apply + verify
-```
-
-**逻辑要点**：
-
-- **替换方式**：保存原方法 → 包装 → 重新赋值（与插件系统相同）；
-- **防重复**：用 `setattr(marker)` 标记 + `_run_engine_core_active` 重入守卫；
-- **子进程生效**：靠 fork 自己 patch 了 `run_engine_core` 子进程入口，在子进程里重新 apply——这是 vllm_gr 能用的根本原因；
-- **校验**：每个 patch 有 `verify` 函数，启动后输出 `BeamPatchReport`。
-
-#### 7.3.2 vLLM general_plugins：源码与逻辑
-
-**核心逻辑**：patch 定义为 `VLLMPatch[Target]` 子类 → `manager.register(name, PatchClass)` 注册 → 每进程启动早期自动加载。
-
-源码证据（博客原样）：
-
-```python
-# ① patch 定义：只替换目标类的某一个方法
-class PrioritySchedulerPatch(VLLMPatch[Scheduler]):
-    @min_vllm_version("0.8.0")
-    def apply(self, target_cls):
-        target_cls.schedule = priority_schedule   # 只替换 schedule
-
-# ② 注册与启用
-def register_patches():
-    manager.register('PriorityScheduler', PrioritySchedulerPatch)
-    manager.apply_from_env()                      # 按环境变量选择启用
-
-# ③ setup.py 注册 entry point
-entry_points={
-    'vllm.general_plugins': ['custom_patches = vllm_custom_patches:register_patches']
-}
-```
+**我们的调用流程（现在）**：
 
 ```text
-# ④ vLLM 生命周期：每个进程（main / EngineCore / worker）启动早期
-load_general_plugins() → 发现 entry point → 调用 register_patches()
-→ manager.apply_from_env() → VLLMPatch.apply() → 替换方法
-→ 之后才创建 Scheduler / 加载模型
+pyproject.toml 注册 vllm_gr = "vllm_gr.plugin:register"（general_plugins entry point）；
+插件在每个进程加载 register() → initialize_runtime() → re_apply_patches()，保证 wrapper 被安装；
+真正替换 Scheduler.schedule 的是 run_engine_core wrapper——它在 EngineCore 子进程 spawn 后
+调用 apply_engine_core_child_patches()（含 apply_scheduler_patch() + apply_worker_patches()）。
 ```
 
-**逻辑要点**：
+**插件的调用流程（VLLMPatch）**：
 
-- **替换方式**：`apply()` 里 `target_cls.schedule = ...`（与我们的重新赋值相同）；
-- **子进程生效**：由 vLLM 官方 `load_general_plugins()` 在**每个进程**保证，不需要自己 patch 子进程入口；
-- **版本守卫**：`@min_vllm_version`；
-- **选择性启用**：环境变量按 patch 名。
-
-#### 7.3.3 源码级逐行对比
-
-| 动作 | 我们（fork monkey patch） | vLLM general_plugins |
-|---|---|---|
-| 替换方法 | `Scheduler.schedule = patched_schedule` | `target_cls.schedule = priority_schedule`（`apply()` 内） |
-| 保存原方法 | `_original_schedule = Scheduler.schedule`（包装后调用） | 博客示例直接替换；如需调用原版需自行保存 |
-| 注册 | `BeamPatch(name, apply, verify)` 元组表 | `manager.register('PriorityScheduler', PrioritySchedulerPatch)` |
-| 应用入口 | `_initialize_beam_patch_plan(...)` 手动调用 | `manager.apply_from_env()` |
-| 子进程生效 | `run_engine_core` wrapper 里重新 apply（fork 自己写） | `load_general_plugins()` 每进程自动调用 |
-| 防重复 | `setattr(marker)` + 重入守卫 | manager 注册一次；vLLM 每进程只 load 一次 |
-| 校验/守卫 | 每个 patch 的 `verify()` + `BeamPatchReport` | `@min_vllm_version` 版本守卫 |
-
-#### 7.3.4 逻辑级对比
-
-| 维度 | 我们（fork monkey patch） | vLLM general_plugins |
-|---|---|---|
-| 生效机制 | fork 改子进程入口，spawn 后子进程里重打 | 官方每进程启动早期自动加载 |
-| patch 载体 | 散落在 `vllm_gr/*.py` + `BeamPatch` 注册表 | 独立 pip 包 + `setup.py` entry point |
-| 子进程 | 自己处理（wrapper 重打） | 官方保证 |
-| 版本管理 | 无，升级 vLLM 手工同步 | `@min_vllm_version` |
-| 选择性启用 | 按进程分工两套 patch 表（required / engine_core） | 环境变量按 patch 名 |
-| 升级 vLLM | rebase fork、核对散落 patch、回归 | `pip install --upgrade vllm`，插件不动 |
-| 分发 | 整个 fork | 独立小 pip 包 |
-| 官方支持 | 无（黑盒绕开 API） | `vllm.general_plugins` 官方扩展点 |
-
-#### 7.3.5 结论
-
-**机制等价**：两种方式都是“运行时替换类的个别方法、不复制整个类”，本质相同。
-
-**差异只在三件事**：① 谁保证子进程生效（fork 自己写 wrapper vs 官方每进程加载）；② 版本与启用管理（无 vs `@min_vllm_version` + 环境变量）；③ 分发形态（整个 fork vs 独立 pip 包）。
-
-**建议**：把 `patch.py` 里**调度相关的 patch**（`Scheduler.schedule` 等）收拢成 `vllm.general_plugins` 包，用 `VLLMPatch` 写法重写；模型/推理类 patch 可继续留在 fork 内。
-
-#### 7.3.6 现状核对：我们其实已经接入 general_plugins，子进程生效已做到
-
-**结论：✅ 子进程生效已经做到。但机制是两层配合，不是“插件在子进程里直接 patch Scheduler”。**
-
-证据：
-
-```toml
-# pyproject.toml L60-61
-[project.entry-points."vllm.general_plugins"]
-vllm_gr = "vllm_gr.plugin:register"
+```text
+setup.py 注册 vllm.general_plugins → 每个进程 load_general_plugins()
+→ register_patches() → manager.register('PriorityScheduler', PatchClass)
+→ manager.apply_from_env() → VLLMPatch.apply() → 替换目标方法（如 Scheduler.schedule）。
 ```
 
-```python
-# vllm_gr/plugin.py —— 每个进程（main / EngineCore / worker）都会执行
-def register():
-    state = initialize_runtime()   # re_apply_patches() + _register_models()
-```
-
-```python
-# vllm_gr/v1/engine/engine_core_patch.py —— 子进程生效的真正落点
-def apply_engine_core_child_patches():
-    apply_engine_core_request_patches()
-    apply_scheduler_patch()        # ← 这里才替换 Scheduler.schedule
-    apply_worker_patches()
-
-def run_engine_core(*args, **kwargs):
-    """...In the spawned child process, all modules are freshly imported, so
-    EngineCoreProc.run_engine_core is the original unpatched version.
-    We apply our patches first, then delegate to the original."""
-    apply_engine_core_child_patches()
-    return original_run(*args, **kwargs)
-```
-
-**机制拆解**：
-
-1. `general_plugins` 每进程加载 `register()` → `initialize_runtime()` → `re_apply_patches()`，保证 **wrapper 被安装**、patch 状态可验证；
-2. `batch_and_fork` patch 把 `EngineCoreProc.run_engine_core` 换成我们的 wrapper；
-3. EngineCore **子进程 spawn 后**（模块全新、Scheduler 是原版），wrapper 调用 `apply_engine_core_child_patches()`，**在这里** `Scheduler.schedule` 才被替换。
-
-所以准确表述是：**“子进程生效”是我们 fork 自己用 wrapper 实现的**；插件系统只保证了 wrapper 被装上。Scheduler 在插件加载时往往还没被 import，插件本身并没有直接 patch 它。
-
-#### 7.3.7 那我们现在的代码也能精准替换，VLLMPatch 的意义是什么？
-
-**功能层：等价。** 我们的 `Scheduler.schedule = patched_schedule` 就是精准替换单个方法、不复制整类，和 VLLMPatch `apply()` 里的 `target_cls.schedule = priority_schedule` 本质相同。
-
-**工程层：有明确差异。** VLLMPatch 的意义不是“能不能替换”，而是把“替换什么、怎么管理、怎么分发”声明化：
-
-| 需求 | 我们现状（函数式 patch） | VLLMPatch 声明式类 |
-|---|---|---|
-| 精准替换单个方法 | ✅ 已做到 | ✅ |
-| 版本守卫（`@min_vllm_version`） | ❌ 无 | ✅ |
-| 按名启用（`apply_from_env`） | ❌ 启动即全打 | ✅ |
-| 注册集中管理 | ⚠️ `BeamPatch` 注册表（半集中） | ✅ 类 + manager |
-| 独立分发（pip 包） | ❌ 依赖 fork | ✅ |
-| 子进程生效 | ⚠️ 自己写 wrapper（fork 私有，升级易碎） | ✅ 官方保证 |
-
-**分析结论**：
-
-- 我们的代码在功能上**已经等价**（都能精准替换、都能子进程生效），所以“引入 VLLMPatch”不是“从不能做到能做”，而是**工程升级**；
-- 真正值得做的三件事：① 给 patch 加版本守卫；② 支持按名选择性启用（多模型一个 build）；③ 把“子进程生效”从 fork 私有 wrapper 换成官方机制，降低升级成本；
-- 迁移方式：保留 `initialize_runtime()` 作为总入口，把 `patch.py` 里的调度类 patch 逐条改写成 `class GRBatchSchedulerPatch(VLLMPatch[Scheduler])` 并注册到 manager；`run_engine_core` wrapper 逐步退化为兜底。
+**一句话**：机制等价（都是运行时替换个别方法）；我们靠 fork 自己写的 `run_engine_core` wrapper 保证子进程生效，插件靠官方每进程加载保证；插件额外提供版本守卫、按名启用、独立分发。功能上两者都能做到，引入 VLLMPatch 属于工程升级而非能力补齐。
 
 ### 7.4 三种方案对比
 

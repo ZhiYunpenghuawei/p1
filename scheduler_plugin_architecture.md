@@ -1,10 +1,83 @@
 # vllm-gr 调度插件架构设计（单请求 vs 组批输入）
 
-> 状态：架构设计（v0.1）
+> 状态：架构设计（v0.2，扩展版）
 > 关联文档：
 > - [调度终版方案](scheduler_final_design.md)（实施基线：固定 batch + 固定图 + FIFO）
 > - [调度策略插件设计方案](scheduler_plugin_design.md)（策略转接中间态）
 > - vLLM 官方参考：[SchedulerConfig](https://docs.vllm.ai/en/latest/api/vllm/config/scheduler/)、[Plugin System](https://vllm.ai/blog/2025-11-20-vllm-plugin-system)
+
+---
+
+## 0. 两个前置结论（先定死的设计决策）
+
+> 这两个结论来自方案讨论，后续所有架构都建立在其上，不再反复权衡。
+
+### 0.1 padding 时机：发生在 worker 的图输入准备阶段
+
+**结论：调度器不 pad，长度一律用 metadata 记录；真正的“padding”是图形状自带的，发生在 worker 图 replay 前。**
+
+| 层 | 做什么 | 是否 pad |
+|---|---|---|
+| 业务/输入层 | 标记 bucket（900/1000 → 1024） | 否 |
+| 调度器 | 按 bucket 分组，预算按**真实长度**计 | 否 |
+| Worker 输入准备 | 把真实输入拷进固定形状静态 buffer；`seq_lens` / `slot_mapping` / `query_lens` 记录真实长度 | 图级自动 pad（空槽不参与 attention） |
+| Worker 图 replay | 按固定形状（如 8×1024）执行 | — |
+
+```mermaid
+flowchart LR
+    R[请求 900 token] -->|bucket=1024 标记| S[调度器<br>预算按 900 计]
+    S --> W1[Worker 输入准备<br>900 拷入 1024 形状静态 buffer<br>metadata: seq_lens=[900...]]
+    W1 --> W2[图 replay 8×1024<br>pad 槽位被掩码]
+    W2 --> O[输出切回真实部分]
+```
+
+**要点**：
+
+- 物理 pad（把 900 改成 1024）只在“kernel 不支持变长/掩码”时才需要，且时机在发车时；
+- 图级 pad 下，调度预算、KV 分配都按真实长度，只有图内计算按 bucket 形状；
+- decode 阶段长度是数据（每步 1 token），不需要按长度 pad，长度只影响 KV 容量档。
+
+### 0.2 图数量估算与缓存对比
+
+**结论：我们的图数量最少（30~52 张），一定能放下；NVIDIA 卡在 128 张 LRU 上限边缘；ACS 数量最多但靠共享内存池消化，超配置会报错。**
+
+参数假设：batch 固定 1 档（B=1，batch=8）、长度 bucket L=3~4、beam 档 W=3~4、decode 步数 S=3。
+
+**我们**：`G = L × (1 + S × W × B)`，B=1
+
+| L | W | decode 图 S×W×B×L | prefill 图 L | 合计 |
+|---|---|---|---|---|
+| 3 | 3 | 27 | 3 | **30** |
+| 3 | 4 | 36 | 3 | **39** |
+| 4 | 3 | 36 | 4 | **40** |
+| 4 | 4 | 48 | 4 | **52** |
+
+**NVIDIA（GPU）**：`G = S × W × B × L`，batch 默认 4 档（B=4），decode LRU 上限 128、prefill 上限 32
+
+| L | W | 图数 | ≤128? |
+|---|---|---|---|
+| 3 | 3 | 3×3×4×3 = 108 | ✅ 能放下 |
+| 3 | 4 | 144 | ❌ 淘汰重捕获 |
+| 4 | 3 | 144 | ❌ 淘汰重捕获 |
+| 4 | 4 | 192 | ❌ 淘汰重捕获 |
+
+**ACS（NPU）**：`G = #bs档 × #seq档 × 每组合图数`（N=4 非逐层 prefill 时每组合 10 张），启动全预捕获、无缓存上限
+
+| 配置 | 组合数 | 图数 | 能否放下 |
+|---|---|---|---|
+| demo 默认（max_batch=1, max_model_len=10240, step=500） | 22×1 | 220 | ✅ 共享 pool，内存受控 |
+| max_batch=8（对应我们 batch=8） | 16×1 | 160 | ✅ 同上 |
+| beam 展开后总行数超 max_batch_size | — | — | ❌ 缺图报错 |
+
+**对比结论**：
+
+| | 图数量 | 能否放下 |
+|---|---|---|
+| 我们 | 30~52 | ✅ 完全没问题 |
+| NVIDIA | 108（L3W3）~ 192（L4W4） | ⚠️ 仅 L=3、W=3 时 ≤128 |
+| ACS | 160~220 | ✅ 全预捕获 + 共享池；超配置报错 |
+
+> 注：若采用逐层成图（ACS 风格）或 prefill piecewise，每张“逻辑图”会拆成多张物理图，实际数量 = 逻辑图数 × 每图物理段数。
 
 ---
 
@@ -22,203 +95,187 @@
 ### 1.2 设计目标
 
 - **双路径入口、单一执行出口**：单请求和组批最终都变成同一个 `BatchSpec`，引擎/图执行完全共用；
-- **接入 vLLM 的官方扩展点**：优先用 `SchedulerConfig.scheduler_cls` 注入自定义调度器，其次用 `general_plugins` 机制做插件化；
+- **插件化接入 vLLM**：用 `vllm.general_plugins`（方案 B）打包分发，`SchedulerConfig.scheduler_cls` 作为内部注入手段；
 - **图保持固定**：warmup 全量捕获、bucket 标记、缺图报错，不引入运行时捕获；
-- **协议可扩展**：单/批区分通过请求协议字段表达，不改变 vLLM 核心执行语义。
+- **padding 时机固定**：worker 图输入准备阶段，长度走 metadata（见 0.1）；
+- **图数量可预算**：按 0.2 的公式在启动时确认，内存可提前规划。
 
 ---
 
 ## 2. 总体架构
 
+### 2.1 分层架构
+
 ```mermaid
-flowchart LR
-    subgraph IN["输入层（Serving / API）"]
+flowchart TD
+    subgraph L1["① 协议/输入层（Serving / API）"]
         S1[单条请求]
         S2[业务方组批<br>skip_wait / group_hint]
     end
-    subgraph PLUGIN["调度插件（vllm_gr.scheduling）"]
+    subgraph L2["② 调度插件 vllm_gr.scheduling"]
         A[RequestAdapter<br>区分单/批]
         B[BucketRouter<br>长度归桶]
         C[BatchAssembler<br>FIFO 攒批 / 直发]
-        V[GraphValidator<br>bucket→图存在性]
+        V[GraphValidator<br>bucket → 图存在性]
     end
-    subgraph ENGINE["EngineCore（子进程）"]
-        SCH[GRBatchScheduler<br>自定义 Scheduler<br>（scheduler_cls 注入）]
-        W[Worker<br>图 replay：prefill + step1..N]
+    subgraph L3["③ EngineCore（子进程）"]
+        SCH[GRBatchScheduler<br>继承 Scheduler<br>scheduler_cls 注入]
+        M[KV / 预算管理]
+    end
+    subgraph L4["④ Worker（GPU/NPU）"]
+        P[输入准备<br>静态 buffer + metadata]
+        G[图注册表<br>warmup 全量捕获]
+        R[图 replay<br>prefill + step1..N]
     end
 
     S1 --> A
     S2 --> A
-    A --> B --> C --> V --> |BatchSpec| SCH --> W
+    A --> B --> C --> V -->|BatchSpec| SCH --> M --> P --> R
+    G -. 查询/缺图报错 .-> P
 ```
 
-**分层原则**：
+### 2.2 进程视图（插件在哪里加载）
 
-- **输入层**只做协议解析（这是单/批区分发生的地方）；
-- **调度插件**只做“选批”（谁、什么时候、归哪个 bucket），不碰图执行；
-- **EngineCore** 通过 `scheduler_cls` 运行我们的自定义 Scheduler，输出标准调度结果；
-- **Worker** 按固定图执行，全程不知道请求是单发还是组批来的。
+```mermaid
+flowchart LR
+    subgraph MAIN["Main 进程"]
+        PLUGIN[general_plugins 加载<br>VLLMPatch 注册]
+        CFG[配置解析<br>scheduler_cls / buckets / admission_mode]
+    end
+    subgraph EC["EngineCore 子进程"]
+        SCH2[GRBatchScheduler<br>由 scheduler_cls 实例化]
+    end
+    subgraph WK["Worker 子进程"]
+        WR[图注册表 / KV / replay]
+    end
+
+    PLUGIN -->|每个进程都加载| EC
+    PLUGIN -->|每个进程都加载| WK
+    CFG --> SCH2
+```
+
+**关键点**：`general_plugins` 在 **main / EngineCore / worker 每个进程**启动前加载（vLLM 官方保证），所以 patch 在调度器创建前生效——这是 monkey patch 做不到的。
+
+### 2.3 职责边界
+
+| 组件 | 职责 | 不做什么 |
+|---|---|---|
+| 输入层 | 协议解析、单/批识别 | 不做调度决策 |
+| 调度插件 | 选批（谁、何时、哪个 bucket） | 不碰 KV/图/执行 |
+| EngineCore | 调度输出、预算管理 | 不解析业务策略 |
+| Worker | 图执行、输入准备 | 不感知单/批来源 |
 
 ---
 
 ## 3. 单请求 vs 组批：双路径设计
 
-### 3.1 统一入口与分叉点
+### 3.1 判定规则
+
+| 输入 | 判定 | 路径 |
+|---|---|---|
+| 普通请求（无标记） | `admission_mode` 允许 single | FIFO 攒批 |
+| 组批请求（`skip_wait` / `group_hint`） | bucket 校验通过 | 直发 |
+| 组批请求 | bucket 校验失败 | 报错拒绝 |
+
+### 3.2 决策流程
 
 ```mermaid
 flowchart TD
     R[请求到达] --> P{RequestAdapter 解析}
-    P -->|普通单条请求| B1[按长度归入 bucket]
+    P -->|单条| B1[按长度归入 bucket]
     B1 --> Q[bucket 内 FIFO 队列]
-    Q -->|攒满 batch_size| D[生成 BatchSpec]
+    Q -->|攒满 batch_size| D[生成 BatchSpec<br>admission=single]
     Q -->|超过 max_wait_ms| D
-    P -->|组批请求 skip_wait / group_hint| B2[校验组内长度 bucket 一致<br>取最大归桶]
-    B2 --> V{图存在性校验<br>bucket 在配置内}
-    V -->|否| ERR[报错：缺图 / 配置外]
-    V -->|是| D
-    D --> E[引擎执行<br>prefill 一次 + decode 按 beam 展开]
+    P -->|组批| B2[校验组内长度 bucket 一致<br>取最大归桶]
+    B2 --> V{GraphValidator<br>bucket 在配置内且图存在?}
+    V -->|否| ERR[报错：缺图 / 配置外<br>拒绝该组]
+    V -->|是| D2[直发生成 BatchSpec<br>admission=grouped, skip_wait=true]
+    D --> E[GRBatchScheduler 调度]
+    D2 --> E
+    E --> W[Worker 图执行<br>prefill 一次 + decode 按 beam 展开]
 ```
 
-### 3.2 两条路径的职责
-
-| 路径 | 触发条件 | 行为 | 延迟特征 |
-|---|---|---|---|
-| 单请求（FIFO） | 无 `skip_wait` / `group_hint` | 进 bucket 队列；攒满 `batch_size` 或超时发车 | 有攒批等待 |
-| 组批（直发） | 带 `skip_wait` / `group_hint` | 校验后直接生成 BatchSpec，不排队；不足 `batch_size` 则 padding | 无等待，立即执行 |
-
-### 3.3 混合规则
+### 3.3 混合规则与配置
 
 - 组批请求是“显式契约”，**不进 FIFO 队列**，不与单请求混拼；
-- FIFO 队列只收单请求（终版不做“组批拆开补进队列”的合并逻辑）；
-- 同一时间两种流量可以并存：各自走各自路径，最终都到同一个 `BatchSpec` 出口；
-- 通过 `admission_mode` 配置控制默认行为：
-
-```yaml
-admission_mode: auto        # auto | single_only | grouped_only
-```
-
-- `auto`：两种都支持（推荐默认）；
-- `single_only`：组批请求按普通请求处理（进队列）；
-- `grouped_only`：单请求也要求业务方给出组批标记，否则按 bucket 单独直发（等价于 min_batch=1 的 FIFO）。
-
-### 3.4 不同模型的处理
-
-- 模型级配置决定默认模式，例如模型 A 业务方总组批 → `grouped_only`；模型 B 单发 → `single_only`；
-- 图、bucket、beam 展开逻辑与输入方式无关，全部复用。
+- FIFO 队列只收单请求（终版不做组批拆开补队的合并逻辑）；
+- `admission_mode` 按模型配置：`auto`（默认，两种都支持）/ `single_only` / `grouped_only`。
 
 ---
 
-## 4. 与 vLLM 的接入点（三种方案）
+## 4. 模块设计
 
-### 4.1 方案 A：`SchedulerConfig.scheduler_cls` 注入自定义 Scheduler（推荐）
-
-vLLM 官方配置字段（[SchedulerConfig 文档](https://docs.vllm.ai/en/latest/api/vllm/config/scheduler/)）：
-
-```text
-scheduler_cls: "The scheduler class to use. 'vllm.v1.core.sched.scheduler.Scheduler' is
-the default scheduler. Can be a class directly or the path to a class of form 'mod.custom_class'."
-```
-
-做法：
-
-```yaml
-scheduler_cls: "vllm_gr.scheduling.GRBatchScheduler"
-```
-
-`GRBatchScheduler` 继承 `Scheduler`，在 `schedule()` 中：
-
-1. 消费我们协议扩展带来的 `BatchSpec` 组（单/批都已折叠成批）；
-2. 按 `(length_bucket, step)` 分组输出调度结果；
-3. 图存在性校验前置（bucket 不在配置内 → 拒绝/报错）；
-4. 其余预算逻辑（`max_num_batched_tokens` / `max_num_seqs`）沿用父类。
-
-**注意事项（官方已警告）**：
-
-- 自定义 scheduler 接口**不是公开 API**，升级可能不兼容（需要版本守卫）；
-- 子类化 `Scheduler` 会**禁用 async scheduling**（对我们无影响，终版不依赖异步）；
-- 与 `AsyncScheduler` 相比性能路径不同，压测时要对比确认。
-
-### 4.2 方案 B：`vllm.general_plugins` 插件化（脱离 fork 的路径）
-
-vLLM 插件系统（[Plugin System 博客](https://vllm.ai/blog/2025-11-20-vllm-plugin-system)）：
-
-- 通过 `vllm.general_plugins` entry point 注册插件包；
-- vLLM 在**每个进程**（main、EngineCore、worker）启动前加载插件，再创建 scheduler——这解决了“monkey patch Scheduler 在 EngineCore 子进程不生效”的问题；
-- 用 `VLLMPatch[TargetClass]` 做外科手术式修改，可带 `@min_vllm_version` 版本守卫。
-
-做法：
-
-```python
-# setup.py 注册
-entry_points={"vllm.general_plugins": ["vllm_gr_sched = vllm_gr_sched.plugin:register_patches"]}
-
-# plugin.py
-def register_patches(manager):
-    manager.register(
-        VLLMPatch[Scheduler]
-        .replace_method("schedule", gr_schedule)
-        .when_configured_by("scheduler_cls", "vllm_gr.scheduling.GRBatchScheduler")
-    )
-```
-
-**适用场景**：未来不想长期维护 fork，想直接 `pip install` vLLM + 插件包部署时使用。
-
-### 4.3 方案 C：Serving 层插件（协议层，第一版推荐先做）
-
-- 单/批的解析、`skip_wait`/`group_hint` 识别、bucket 归组全部放在 **Serving 与 EngineCore 之间**（`vllm_gr/entrypoints/recif/serving_engine.py` / `openai/serving_engine.py` 现有扩展协议基础）；
-- EngineCore 侧的 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE` 协议扩展字段（`skip_wait`、`group_hint`、`bucket`），不改变 vLLM 执行语义；
-- 优点：不动 Scheduler，先验证业务路径；缺点：攒批逻辑在 Serving 进程，EngineCore 空闲时无法主动拉批（可用现有 `step_with_batch_queue` / Pull 模式补）。
-
-### 4.4 推荐组合
-
-| 阶段 | 用哪个方案 | 理由 |
-|---|---|---|
-| 第一版 | **C（协议层）+ A（scheduler_cls）** | 业务路径先通，调度器按官方配置注入，不碰 vLLM 源码 |
-| 第二版 | B（general_plugins） | 验证脱离 fork；插件包内同时含协议解析与 Scheduler patch |
-| 不做 | 传统 monkey patch | EngineCore 子进程不生效 + 升级必碎 |
-
----
-
-## 5. 模块划分与接口
+### 4.1 模块包结构
 
 ```text
 vllm_gr/scheduling/
-├── types.py            # BatchSpec / 单批协议扩展 / 配置
-├── adapter.py          # RequestAdapter：解析单条 / 组批
-├── router.py           # BucketRouter：长度归桶、beam 展开信息
-├── assembler.py        # BatchAssembler：FIFO 攒批 / 直发
-├── validator.py        # GraphValidator：bucket → 图存在性
-├── scheduler.py        # GRBatchScheduler(Scheduler)：engine 侧调度
-└── config.py           # per-model 配置加载与校验
+├── __init__.py          # 插件入口：register_patches()
+├── types.py             # BatchSpec / AdmissionKind / 协议扩展字段
+├── adapter.py           # RequestAdapter：单/批解析
+├── router.py            # BucketRouter：长度归桶、beam 信息
+├── assembler.py         # BatchAssembler：FIFO / 直发状态机
+├── validator.py         # GraphValidator：bucket → 图存在性
+├── registry.py          # GraphRegistry：warmup 图注册表（Worker 侧）
+├── scheduler.py         # GRBatchScheduler(Scheduler)：EngineCore 侧
+├── config.py            # per-model 配置加载与校验
+└── plugin.py            # general_plugins 注册与 VLLMPatch 定义
 ```
+
+### 4.2 模块职责
+
+| 模块 | 输入 | 输出 | 关键逻辑 |
+|---|---|---|---|
+| `adapter.py` | 原始请求 | `AdmissionKind`（single/grouped） | 读 `skip_wait` / `group_hint` |
+| `router.py` | 请求/组 | bucket + beam 信息 | 第一个 ≥ 实际长度的 bucket |
+| `assembler.py` | bucket 队列 / 组 | `BatchSpec` | FIFO 攒批、超时发车、直发 |
+| `validator.py` | BatchSpec | 通过/拒绝 | bucket ∈ 配置 ∧ 图存在 |
+| `registry.py` | bucket/step | 图句柄 | warmup 全量捕获后的查询表 |
+| `scheduler.py` | BatchSpec 流 | SchedulerOutput | 按 (bucket, step) 分组输出 |
+| `plugin.py` | — | VLLMPatch 注册 | entry point 加载 |
+
+### 4.3 类图
 
 ```mermaid
 classDiagram
     class RequestAdapter {
         +parse(req) AdmissionKind
         +is_grouped(req) bool
+        +extract_group_hint(req) str|None
     }
     class BucketRouter {
-        +route(req) bucket
-        +resolve_length_bucket(len) int
+        +route(req) int
+        +resolve_length_bucket(length) int
+        +resolve_beam_bucket(bw) int
     }
     class BatchAssembler {
         +enqueue(req)
         +dispatch_group(group)
-        +next_batch(now) BatchSpec
+        +next_batch(now) BatchSpec|None
+        +on_tick(now)
+        -queues: dict[int, deque]
     }
     class GraphValidator {
-        +validate(bucket) bool
+        +validate(spec) bool
+        +ensure_configured(bucket) None
+    }
+    class GraphRegistry {
+        +get(bucket, step) Graph
+        +warmup_all(config) None
+        -graphs: dict[tuple, Graph]
     }
     class GRBatchScheduler {
         +schedule() SchedulerOutput
+        +consume_batch(spec) None
+        -batch_queue: deque[BatchSpec]
     }
     class BatchSpec {
-        +batch_id
-        +request_ids
-        +bucket
-        +admission: single | grouped
+        +batch_id: str
+        +request_ids: tuple
+        +bucket: int
+        +admission: str
         +skip_wait: bool
+        +group_hint: str|None
+        +beam_widths: dict
     }
 
     RequestAdapter --> BucketRouter
@@ -226,73 +283,191 @@ classDiagram
     BatchAssembler --> GraphValidator
     BatchAssembler --> BatchSpec
     BatchSpec --> GRBatchScheduler
+    GraphValidator ..> GraphRegistry : 查询
 ```
 
-**核心数据契约：BatchSpec（扩展字段）**
+### 4.4 核心数据结构：BatchSpec
 
 ```python
 @dataclass(frozen=True)
 class BatchSpec:
     batch_id: str
     request_ids: tuple[str, ...]
-    bucket: int                      # 长度 bucket
-    admission: str                   # "single" | "grouped"
-    skip_wait: bool = False          # 组批直发标记
+    bucket: int                       # 长度 bucket
+    admission: str                    # "single" | "grouped"
+    skip_wait: bool = False
     group_hint: str | None = None
-    beam_widths: dict[str, int] = field(default_factory=dict)  # request_id -> bw
+    beam_widths: dict[str, int] = field(default_factory=dict)
     expected_len: int
+    created_at: float
+```
+
+JSON 示例（组批）：
+
+```json
+{
+  "batch_id": "grp-1723-1024",
+  "request_ids": ["r1", "r2", "r3"],
+  "bucket": 1024,
+  "admission": "grouped",
+  "skip_wait": true,
+  "group_hint": "recall-1",
+  "beam_widths": {"r1": 128, "r2": 256, "r3": 128},
+  "expected_len": 1000,
+  "created_at": 1723000000.0
+}
 ```
 
 ---
 
-## 6. SchedulerConfig 参数映射
+## 5. 关键流程
 
-我们复用/覆盖 vLLM 的哪些调度参数：
+### 5.1 单请求时序
 
-| 参数 | 默认 | 我们的用法 | 说明 |
-|---|---|---|---|
-| `scheduler_cls` | `Scheduler` | `vllm_gr.scheduling.GRBatchScheduler` | 自定义调度器注入点（方案 A） |
-| `policy` | `fcfs` | `fcfs` | 与我们 FIFO 一致，不改 |
-| `max_num_seqs` | 128 | 设为固定 batch 容量（如 8） | 控制每步最多序列数 |
-| `max_num_batched_tokens` | 2048 | 按真实长度预算 | 图级 padding 不占预算；若物理 pad 则要按 pad 后长度计 |
-| `enable_chunked_prefill` | True | 保持默认或按 bucket 关闭 | 长 prefill 若与固定长度图冲突，关闭 chunked、按 bucket 截断 |
-| `scheduler_reserve_full_isl` | True | 保持 | 准入前检查全长是否放得下 KV |
-| `watermark` | 0.0 | 按需 | KV 余量，避免抢占抖动 |
-| `async_scheduling` | None | 不启用 | 自定义 Scheduler 会禁用 async，接受 |
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant A as RequestAdapter
+    participant C as BatchAssembler
+    participant V as GraphValidator
+    participant S as GRBatchScheduler
+    participant W as Worker
 
-**原则**：**凡是不影响“固定图”的语义，全部沿用 vLLM 默认；只有三处必须动——`scheduler_cls`（注入）、`max_num_seqs`（固定 batch）、协议扩展（单/批区分）。**
+    U->>A: 单条请求（长度 900）
+    A->>C: admission=single, bucket=1024
+    C->>C: 进 FIFO 队列
+    Note over C: 攒满 8 或超时
+    C->>V: BatchSpec 校验
+    V-->>C: 通过
+    C->>S: submit_batch(spec)
+    S->>W: 调度输出
+    W->>W: prefill 图一次 + decode 按 beam 展开<br>（长度走 metadata）
+    W-->>S: 完成
+    S-->>U: 结果
+```
+
+### 5.2 组批时序
+
+```mermaid
+sequenceDiagram
+    participant U as 业务方
+    participant A as RequestAdapter
+    participant C as BatchAssembler
+    participant V as GraphValidator
+    participant S as GRBatchScheduler
+    participant W as Worker
+
+    U->>A: 组批（3 请求，skip_wait=true）
+    A->>C: admission=grouped, bucket=1024
+    C->>V: 直发校验（不进队列）
+    V-->>C: 通过
+    C->>S: submit_batch(spec)
+    S->>W: 调度输出
+    W->>W: 执行（不足 8 则 padding）
+    W-->>S: 完成
+    S-->>U: 结果
+```
+
+### 5.3 Batch 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> assembling: 单请求入队
+    pending --> validating: 组批直发
+    assembling --> validating: 攒满/超时
+    validating --> running: bucket 校验通过
+    validating --> rejected: 缺图/配置外
+    running --> done: 执行完成
+    running --> failed: 执行失败
+    rejected --> [*]
+    done --> [*]
+    failed --> [*]
+```
 
 ---
 
-## 7. 单/批请求的调度决策流程
+## 6. 图注册表与 KV / metadata
+
+### 6.1 图注册表结构
+
+```text
+GraphRegistry
+├── prefill:  { bucket → prefill 图 }                # L 张
+├── decode:   { (bucket, step) → decode 图 }          # S × L 张（batch-1，beam 展开）
+├── static_buffers: { bucket → 输入/输出静态 buffer }
+├── metadata:  { bucket → 静态 AscendMetadata / attention metadata }
+└── kv_pool:   { bucket → 稳定池切片 }
+```
+
+### 6.2 Worker 输入准备（padding + metadata 流程）
 
 ```mermaid
 flowchart TD
-    A[请求到达] --> B{RequestAdapter}
-    B -->|单条| C[BucketRouter 归桶]
-    C --> D[FIFO 队列]
-    D --> E{攒满 batch_size 或超时?}
-    E -->|否| D
-    E -->|是| F[BatchAssembler 生成 BatchSpec<br>admission=single]
-    B -->|组批| G[BucketRouter 校验组内长度<br>取最大 bucket]
-    G --> H{GraphValidator<br>bucket 在配置内且图存在?}
-    H -->|否| I[报错：拒绝该组]
-    H -->|是| J[直发生成 BatchSpec<br>admission=grouped, skip_wait=true]
-    F --> K[GRBatchScheduler 调度]
-    J --> K
-    K --> L[Worker 图执行<br>prefill 一次 + decode 按 beam 展开]
-    L --> M[完成]
+    A[收到 BatchSpec] --> B[锁定 KV 稳定池切片]
+    B --> C[把真实输入拷入静态 buffer<br>只拷有效行/有效 token]
+    C --> D[构造 attention metadata<br>seq_lens / slot_mapping / query_lens]
+    D --> E{图存在?}
+    E -->|是| F[replay：prefill 图 → step1..N 图]
+    E -->|否| ERR[报错：缺图（warmup 应已全量）]
+    F --> G[输出切回真实部分]
 ```
+
+### 6.3 图数量预算（物理图拆分说明）
+
+- 逻辑图数见 0.2（我们 30~52）；
+- 若采用逐层成图（ACS 风格）或 prefill piecewise，物理图数 = 逻辑图数 × 每图物理段数（例如 decode 逐层 = 层数+1）；
+- 终版默认**每张逻辑图一张物理图**（不做逐层拆分），图数量即 30~52，内存可预算。
 
 ---
 
-## 8. 与图的关系
+## 7. 与 vLLM 的接入（方案对比与插件化）
 
-- **bucket 标记**：单/批路径最终都在 `BatchSpec.bucket` 上统一，图注册表只认 bucket；
-- **warmup 全量捕获**：启动时按（batch × 长度 bucket × beam 档 × step）捕获全部图；
-- **缺图报错**：`GraphValidator` 前置校验，配置外直接拒绝，不缓存、不懒捕获、不 eager；
-- **beam 展开**：decode 阶段每条 beam 作为 batch-1 输入（或按 beam 档合批），prefill 只算一次，与输入方式是单发还是组批无关；
-- **padding**：不足固定 batch 时由 Worker 图输入准备阶段处理（拷入静态 buffer + 真实长度 metadata），调度预算仍按真实长度计。
+### 7.1 三种方案
+
+| 方案 | 机制 | 适合场景 | 结论 |
+|---|---|---|---|
+| A | `SchedulerConfig.scheduler_cls` 配置注入 | fork 内/单机配置 | 作为 B 的内部手段 |
+| **B** | `vllm.general_plugins` + `VLLMPatch` | 插件化分发、跟随上游 | **采用** |
+| C | Serving 层协议插件 | 只改业务层 | 单/批解析可放这里，调度仍走 B |
+
+### 7.2 方案 B：插件加载时序
+
+```mermaid
+sequenceDiagram
+    participant VP as vLLM 启动
+    participant PL as general_plugins
+    participant EC as EngineCore 子进程
+    participant SC as GRBatchScheduler
+
+    VP->>PL: load_general_plugins()（每个进程）
+    PL->>PL: 发现 vllm.general_plugins entry point
+    PL->>PL: register_patches() → VLLMPatch[Scheduler]
+    PL->>SC: 配置 scheduler_cls / 或 patch schedule()
+    Note over EC: 之后才创建 Scheduler / 加载模型
+    EC->>SC: 实例化 GRBatchScheduler
+```
+
+### 7.3 推荐组合
+
+- **调度注入**：方案 B 的插件内设置 `scheduler_cls="vllm_gr.scheduling.GRBatchScheduler"`（或 `VLLMPatch[Scheduler].replace_method("schedule", ...)`）；
+- **协议扩展**：单/批解析在 Serving 层（方案 C 的思想），协议字段进入 EngineCore；
+- **不做**：传统 monkey patch。
+
+---
+
+## 8. SchedulerConfig 参数映射
+
+| 参数 | 默认 | 我们的用法 | 说明 |
+|---|---|---|---|
+| `scheduler_cls` | `Scheduler` | `vllm_gr.scheduling.GRBatchScheduler` | 自定义调度器注入点 |
+| `policy` | `fcfs` | `fcfs` | 与 FIFO 一致，不改 |
+| `max_num_seqs` | 128 | 固定 batch 容量（如 8） | 每步最多序列数 |
+| `max_num_batched_tokens` | 2048 | 按真实长度预算 | 图级 padding 不占预算 |
+| `enable_chunked_prefill` | True | 保持默认或按 bucket 关闭 | 与固定长度图冲突时关闭 |
+| `scheduler_reserve_full_isl` | True | 保持 | 准入前检查全长 KV 放得下 |
+| `watermark` | 0.0 | 按需 | KV 余量 |
+| `async_scheduling` | None | 不启用 | 自定义 Scheduler 会禁用 async，接受 |
 
 ---
 
@@ -302,10 +477,10 @@ flowchart TD
 scheduler_plugin:
   scheduler_cls: "vllm_gr.scheduling.GRBatchScheduler"
   admission_mode: auto            # auto | single_only | grouped_only
-  batch_size: 8                   # 固定 batch，单档
+  batch_size: 8
   length_buckets: [512, 1024, 2048]
   beam_buckets: [128, 256]        # 3~4 种时扩展
-  max_wait_ms: 10                 # FIFO 攒批超时
+  max_wait_ms: 10
   warmup_on_start: true
   graph_missing: error
 ```
@@ -314,11 +489,12 @@ scheduler_plugin:
 
 ## 10. 实施步骤
 
-1. **Step 1（协议层，方案 C）**：扩展 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE` 协议，增加 `skip_wait` / `group_hint` / `bucket`；Serving 层实现 RequestAdapter + BucketRouter + BatchAssembler；
-2. **Step 2（调度器，方案 A）**：实现 `GRBatchScheduler(Scheduler)`，通过 `scheduler_cls` 注入；单测覆盖 FIFO 攒批、超时发车、组批直发、缺图报错；
-3. **Step 3（图校验）**：GraphValidator 与 warmup 图注册表打通，缺图报错路径闭环；
-4. **Step 4（混合流量压测）**：单/批混合负载，验证图命中率 100%、padding 记账、FTT/TBT；
-5. **Step 5（可选，方案 B）**：打包成 `vllm.general_plugins` 插件，验证脱离 fork 部署。
+1. **协议层**：扩展 `ADD_BATCH` / `BEAM_REQUEST_STEP_UPDATE`，增加 `skip_wait` / `group_hint` / `bucket`；Serving 层实现 adapter/router/assembler；
+2. **插件骨架**：`vllm.general_plugins` entry point + `register_patches()` + `VLLMPatch[Scheduler]`；
+3. **调度器**：`GRBatchScheduler(Scheduler)`，FIFO 攒批、超时发车、组批直发、缺图报错；
+4. **图校验**：GraphValidator + GraphRegistry（warmup 全量捕获）打通；
+5. **混合压测**：单/批混合负载，验证图命中率 100%、padding 记账、FTT/TBT、图数量 30~52 内存预算；
+6. **插件分发验证**：`pip install` vLLM + 插件包，脱离 fork 跑通。
 
 ---
 
@@ -326,15 +502,16 @@ scheduler_plugin:
 
 | 风险 | 对策 |
 |---|---|
-| `scheduler_cls` 接口非公开、升级不兼容 | 版本守卫；封装薄适配层；升级时只改 adapter |
-| 自定义 Scheduler 禁用 async scheduling | 压测对比；若吞吐不达标再评估 AsyncScheduler 子类化 |
-| 单/批协议解析分散在 Serving 与 Engine 两侧 | 统一到 `vllm_gr/scheduling/adapter.py`，协议字段集中定义 |
-| 组批请求与 FIFO 队列混排逻辑复杂 | 终版规则：组批不进队列；合并逻辑后置 |
-| EngineCore 子进程加载不到 patch | 用 `scheduler_cls` 或 general_plugins（每进程加载），不做 monkey patch |
-| bucket 配置与流量不匹配 | GraphValidator 前置报错 + 上线前按流量统计配置 |
+| `scheduler_cls` 接口非公开、升级不兼容 | 版本守卫（`@min_vllm_version`）；薄适配层 |
+| 自定义 Scheduler 禁用 async scheduling | 压测对比；不达标再评估 AsyncScheduler 子类化 |
+| general_plugins 每进程加载依赖 entry point 注册 | 插件包安装正确性纳入 CI |
+| 单/批协议解析分散 | 统一到 `vllm_gr/scheduling/adapter.py` |
+| 组批与 FIFO 混排复杂 | 终版规则：组批不进队列；合并后置 |
+| bucket 配置与流量不匹配 | GraphValidator 前置报错 + 上线前统计配置 |
+| 图数量超内存预算 | 按 0.2 公式启动预检；物理图拆分时乘段数 |
 
 ---
 
 ## 附录：一句话总结
 
-**单请求走 FIFO 攒批、组批走 skip_wait 直发，两条路径在 `BatchSpec` 处汇合；调度器用 `scheduler_cls` 注入、协议扩展放在 Serving 层，图保持固定，缺图报错——输入方式不同，执行链完全共用。**
+**单请求走 FIFO 攒批、组批走 skip_wait 直发，在 BatchSpec 处汇合；padding 发生在 worker 图输入准备（长度走 metadata）；图数量 30~52 可预算、warmup 全量捕获、缺图报错；调度器通过 general_plugins + scheduler_cls 接入 vLLM，输入方式不同，执行链完全共用。**

@@ -1,4 +1,5 @@
 # vllm-gr 调度设计
+> 前置说明：本文讨论的调度均以 **batch 为基本单位**——请求先归入 batch（攒批或组批直发），跑图之后的发车、执行、padding、状态流转与统计等各类调度都按 batch 整体进行，而非按单个 request 调度。
 
 > 关联：现有调度 patch 机制见 `vllm_gr/v1/engine/engine_core_patch.py`（`apply_scheduler_patch` 模式）。
 

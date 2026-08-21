@@ -22,7 +22,7 @@
 | `warmup_on_start` | `true` | 启动时全量捕获图 | 启动耗时 vs 运行时零捕获 |
 | `graph_missing` | `error` | 运行时缺图策略 | 默认直接报错 |
 | `prefill_policy` | `error` | 超长 prefill 处理策略：`error` 报错 / `single` 不 batch 单独执行 | 长 prompt 准入 |
-| `max_prefill_len` | `null` | 允许的最大 prompt 长度；`null` 取 `length_buckets` 最大档 | chunk / 报错 / 单独执行的边界 |
+| `max_prefill_len` | `null` | 允许的最大 prompt 长度；`null` 取 `length_buckets` 最大档 | 报错 / 单独执行的边界 |
 
 **per-model 配置示例**：
 
@@ -164,16 +164,16 @@ flowchart TD
 
 这带来的直接好处是：prefill 阶段和 decode 阶段一样，都是“按 batch 整体调度”，没有额外的跨请求等待；不同长度带来的形状差异由 padding + metadata 消化，而不是靠 barrier 串行化。
 
-### 5.2 Chunk prefill（长 prompt 分块）
+### 5.2 不做 chunk prefill（长 prompt 一次算完）
 
-长 prompt 复用 vLLM 原生 chunked prefill，不自己实现分块逻辑：
+本设计完全不做 chunk prefill：一个 child request 的 prompt 在一次 prefill 执行里整体算完，不跨多个调度 tick 分块推进。
 
-- 每个 child request 的 prompt 切成多个 chunk，跨多个调度 tick 推进；
-- chunk 之间通过 vLLM 的 continuous batching 与其它请求共享 token budget；
-- 每个 chunk 的 `get_computed_blocks` / block hash / KV block 分配仍走 vLLM 原生路径；
-- 好处：长 prompt 不阻塞短 prompt，且单次 prefill 的执行行数受 chunk 限制，不需要为任意长度捕获超大 prefill 图。
+这带来一个硬约束：prefill 的执行形状必须固定，因此 prompt 长度必须被限制在某个档位内：
 
-调度器不绕过 vLLM Scheduler 的 token budget：chunk 是否继续推进由原版 Scheduler 决定，本插件只在发车前决定“这个 batch 以什么形状进入 prefill 图”。
+- 长度靠 `length_buckets` 分桶，一次 prefill 只跑对应长度档的固定 prefill 图；
+- `max_prefill_len` 封顶，超过即按 `prefill_policy` 处理（`error` / `single`）；
+- 不存在 chunk 状态，也不需要跨 tick 保存中间 prefill 进度；
+- 不同请求之间仍走 vLLM continuous batching 共享 token budget，但单个请求自身不分块。
 
 ### 5.3 超长 prefill：不 batch 或直接报错
 
@@ -190,7 +190,7 @@ flowchart TD
 
 Prefill 阶段的 KV 完全复用 vLLM 原生 paged KV cache + prefix cache，不额外建 KV 层：
 
-- 每个 child request 使用原生 `get_computed_blocks` 与 Prefix Cache 命中、Paged KV block 分配与引用计数、chunked prefill、continuous batching；
+- 每个 child request 使用原生 `get_computed_blocks` 与 Prefix Cache 命中、Paged KV block 分配与引用计数、continuous batching；
 - Prefix 复用只采用原生内容匹配，不改变原生 Prefix Cache 的匹配与逐出策略；
 - **Prefix KV 由 Scheduler 持有**：native prefill 写进 paged KV，Session 期间保持绑定，decode 阶段 beam 只读共享的 prefix KV，Worker 不复制 Prompt Paged KV、也不自行释放原生 block；
 - beam 分叉只发生在 suffix：decode 新增的 token 写进专用的 Beam KV（图 / 静态 buffer 池），与原生 prefix KV 分离。
@@ -468,4 +468,4 @@ stateDiagram-v2
 | 长度 bucket 覆盖不全 | 配置外请求报错；上线前按流量统计配置 |
 | 物理 pad 占 token 预算 | 默认图级 padding（metadata）；物理 pad 仅 kernel 不支持变长时用 |
 | 超长 prefill 打爆图 / KV | `max_prefill_len` + `prefill_policy`（`error` / `single`）fail-fast |
-| 长 prompt 阻塞短 prompt | 复用 vLLM chunked prefill，chunk 之间共享 token budget |
+| 长 prompt 拉高 padding / 图尺寸 | 长度分桶 + 固定档位图；超长按 `prefill_policy` fail-fast（`error`/`single`） |

@@ -208,6 +208,41 @@ Native Prefill
 
 一句话：**prefill 用 vLLM 原生 paged KV cache（保证 prefix cache 复用），decode 的 beam suffix 才落专用池**；两者边界清晰，Scheduler 始终是 Prefix KV 的唯一所有者。
 
+### 5.5 Paged KV Cache 使用流程（时序）
+
+下图以一个 child request 从 prefill 到 beam decode 再到释放为例，说明调度器如何复用 vLLM 原生 paged KV cache，以及 beam suffix KV 何时切到专用池：
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant KV as Native Paged KV
+    participant W as Worker
+    participant BK as Beam KV Pool
+
+    S->>S: 长度分桶 + 攒满 batch 发车
+    S->>KV: get_computed_blocks / block hash 查 prefix cache
+    KV-->>S: 命中 blocks（复用）+ 未命中 blocks
+    S->>KV: 未命中部分分配新 paged block（引用计数 +1）
+    S->>W: 下发 prefill 图（只算未命中部分，命中部分不重算）
+    W->>KV: 未命中 token 写入新 paged KV block
+    Note over S,KV: Prefix Paged KV retained，Session 期间保持绑定
+
+    S->>W: 下发 decode 步骤
+    W->>KV: beam 读共享 Prefix KV（paged cache，只读一份）
+    W->>BK: beam suffix KV 写专用 Beam KV pool
+    Note over W,BK: prefix 不复制；beam 只在 suffix 分叉
+    W-->>S: WorkerBeamStepResult
+
+    S->>KV: teardown：child requests + prefix bindings 释放（引用计数 -1）
+    W->>BK: 释放 Beam KV pool 切片
+```
+
+关键点：
+
+- **prefill 命中即复用**：`get_computed_blocks` / block hash 命中前缀，paged block 只增引用计数，不重新分配、不重算；
+- **prefix 只读一份**：decode 阶段 W 条 beam 共享同一份 prefix KV，只有 suffix 部分按 lane 写入专用 Beam KV；
+- **所有权不变**：Prefix KV 的分配与释放始终由 Scheduler 掌控，Worker 不复制 Prompt Paged KV、不自行释放原生 block。
+
 ---
 
 ## 6. 数据契约

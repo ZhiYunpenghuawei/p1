@@ -174,9 +174,9 @@ flowchart TD
 
 这带来的直接好处是：prefill 阶段和 decode 阶段一样，都是“按 batch 整体调度”，没有额外的跨请求等待；不同长度带来的形状差异由 padding + metadata 消化，而不是靠 barrier 串行化。
 
-### 5.2 不做 chunk prefill（长 prompt 一次算完）
+### 5.2 不做 chunk prefill（每个 prompt 一次算完）
 
-本设计完全不做 chunk prefill：一个 child request 的 prompt 在一次 prefill 执行里整体算完，不跨多个调度 tick 分块推进。
+本设计完全不做 chunk prefill：任意 prompt（只要不超过 `max_prefill_len`）都在一次 prefill 执行里整体算完，不跨多个调度 tick 分块推进。
 
 这带来一个硬约束：prefill 的执行形状必须固定，因此 prompt 长度必须被限制在某个档位内：
 
@@ -540,4 +540,4 @@ stateDiagram-v2
 | 批内 beam 不一致 | 组批混 beam 拒绝；FIFO 按 (bucket, beam_width) 分队列 |
 | 长度 bucket 覆盖不全 | 配置外请求报错；上线前按流量统计配置 |
 | 物理 pad 占 token 预算 | 默认图级 padding（metadata）；物理 pad 仅 kernel 不支持变长时用 |
-| 超长 / 长 prompt 打爆图与 KV、拉高 padding | 长度分桶 + 固定档位图；超过 `max_prefill_len` 按 `prefill_policy`（`error`/`single`）fail-fast |
+| 超长 prompt 打爆图与 KV、拉高 padding | 长度分桶 + 固定档位图；超过 `max_prefill_len` 按 `prefill_policy`（`error`/`single`）fail-fast |

@@ -4,6 +4,13 @@
 
 > 一句话设计：**能固定就固定，能预先做就预先做，跑的时候不做动态决策**——图固定、长度分桶、batch 多级、双路径、beam 分档，全部由用户配置，运行时只查图、缺图报错。
 
+> **本文范围与分层**：本文只讨论 **physical execution batch 层**——`BatchSpec` 组装、发车、图形状、padding 与 KV 分工。业务批（BatchBeamSession）到 B 个 child request 的映射、epoch/终态协调属于 EngineCore 层，见 `docs/issue37_enginecore_beam_api_design.md`，本文不展开。
+>
+> 三个概念不要混：
+> - **BatchBeamSession**：业务批，一次提交 B 个输入，是业务/算法生命周期单位；
+> - **child Request**：业务批里每个输入映射出的原生 vLLM Request，是 Prefill / Paged KV / prefix cache 的管理单位（本文的“请求”在 beam 场景下即指它）；
+> - **physical execution batch**：某个调度 tick 实际组装出的执行批，即本文的 `BatchSpec`。
+
 ---
 
 ## 1. 配置总览（先看配置）
@@ -12,24 +19,26 @@
 
 | 配置项 | 默认值 | 含义 | 影响 |
 |---|---|---|---|
+| `enabled` | `true` | 是否启用本调度（`false` 时完全走原版） | 开关 |
 | `assume_grouped` | `false` | `true` 时所有请求（含单条）全部直发、不等待 | 双路径行为 |
-| `batch_buckets` | `[4, 8]` | 多级 batch 档位（用户可配，如 `[8]` / `[4,8,16]`） | 发车档位 + 图数量 |
+| `batch_buckets` | `(8,)` | 多级 batch 档位（用户可配，如 `[8]` / `[4,8]` / `[4,8,16]`） | 发车档位 + 图数量 |
 | `length_buckets` | `[512, 1024, 2048]` | 长度分档，请求归入第一个 ≥ 实际长度的档 | 超档报错（缺图） |
 | `beam_width_buckets` | `[128, 256]` | beam 宽度分档，批内统一 | 图数量 + 批内一致性 |
 | `beam_decode_steps` | `3` | decode 步数（RECIF 默认 3，引擎启动固定） | 图数量 S |
 | `max_wait_ms` | `10` | 攒批超时，超时降级发车 | 时延 vs padding 权衡 |
 | `high_priority_threshold` | `null` | 高优请求直发阈值（`null` = 不启用） | 可选降级路径 |
 | `warmup_on_start` | `true` | 启动时全量捕获图 | 启动耗时 vs 运行时零捕获 |
-| `graph_missing` | `error` | 运行时缺图策略 | 默认直接报错 |
-| `prefill_policy` | `error` | 超长 prefill 处理策略：`error` 报错 / `single` 不 batch 单独执行 | 长 prompt 准入 |
-| `max_prefill_len` | `null` | 允许的最大 prompt 长度；`null` 取 `length_buckets` 最大档 | 报错 / 单独执行的边界 |
+| `graph_missing` | `error` | 运行时缺图策略：`error` 报错 / `warn` 告警放行 | 缺图行为 |
+| `prefill_policy` | `error` | 超长 prefill 处理策略：`error` 报错 / `single` 不 batch 单独执行（本文新增，待落地） | 长 prompt 准入 |
+| `max_prefill_len` | `null` | 允许的最大 prompt 长度；`null` 取 `length_buckets` 最大档（本文新增，待落地） | 报错 / 单独执行的边界 |
 
 **per-model 配置示例**：
 
 ```yaml
 scheduler_plugin:
+  enabled: true
   assume_grouped: false
-  batch_buckets: [4, 8]            # 多级 batch：8 常态、4 降级
+  batch_buckets: [4, 8]            # 多级 batch：8 常态、4 降级（默认 [8]）
   length_buckets: [512, 1024, 2048]
   beam_width_buckets: [128, 256]
   beam_decode_steps: 3
@@ -41,7 +50,7 @@ scheduler_plugin:
   max_prefill_len: null
 ```
 
-**预期图数量**（L=3、S=3、W=2、B=2）：`G = L × (1 + S × W × B) = 3 × (1 + 3×2×2) = 39` 张逻辑图。
+**预期图数量**（以 `length_buckets` 3 档、`beam_decode_steps` 3 步、`beam_width_buckets` 2 档、`batch_buckets` 2 档为例）：`G = L × (1 + S × W × B) = 3 × (1 + 3×2×2) = 39` 张逻辑图；默认 `batch_buckets=(8,)` 时 B=1，图数量相应减半。
 
 ---
 
@@ -55,7 +64,8 @@ scheduler_plugin:
 6. **padding 时机**：worker 图输入准备阶段，长度走 metadata，GPU/NPU 各自实现；
 7. **接入方式**：沿用现有 `apply_scheduler_patch()` 机制，不替换 vLLM `Scheduler` 类、不引入新插件框架。
 8. **不做 Prefill barrier**：不同长度输入按 `length_buckets` 分桶、攒满 batch 发车、算子对变长输入 padding 后同时计算同时出；不存在跨 item 的“所有 prefill 就绪”等待。
-9. **prefill 复用 vLLM 原生 paged KV cache**：Prefix KV 由 Scheduler 持有并复用原生 prefix cache；beam 只在 suffix 分叉，suffix KV 才走专用池。
+9. **不做 chunk prefill**：一个请求的 prompt 在一次 prefill 里整体算完，不跨 tick 分块；超长按 `prefill_policy` 处理（`error` / `single`）。
+10. **prefill 复用 vLLM 原生 paged KV cache**：Prefix KV 由 Scheduler 持有并复用原生 prefix cache；beam 只在 suffix 分叉，suffix KV 才走专用池。
 
 ---
 
@@ -247,38 +257,29 @@ sequenceDiagram
 
 ## 6. 数据契约
 
-### 6.1 BatchSpec（发车单：调度器消费）
+### 6.1 AdmissionKind（入队方式）
+
+```python
+class AdmissionKind(str, Enum):
+    SINGLE = "single"      # 普通请求，FIFO 攒批
+    GROUPED = "grouped"    # 业务方已组批（skip_wait），直发
+```
+
+### 6.2 BatchSpec（发车单：调度器消费）
 
 ```python
 @dataclass(frozen=True)
 class BatchSpec:
     batch_id: str
     request_ids: tuple[str, ...]
-    lengths: dict[str, int]        # request_id -> 实际长度
-    beam_width: int                # 批内统一
-    bucket: int                    # 长度 bucket
-    batch_slot: int                # 选中的 batch 档位（如 4/8/16）
-    admission: AdmissionKind       # "single" | "grouped"
+    lengths: dict[str, int]      # request_id -> 实际长度
+    beam_width: int              # 批内统一
+    bucket: int                  # 长度 bucket
+    batch_slot: int              # 选中的 batch 档位（如 4/8/16）
+    admission: AdmissionKind
     skip_wait: bool = False
     priority: int = 0
-    created_at: float
-```
-
-### 6.2 SchedulerBatchInfo（执行信息：调度器输出给 worker）
-
-```python
-@dataclass(frozen=True)
-class SchedulerBatchInfo:
-    batch_id: str | None
-    bucket: int | None            # 长度 bucket
-    batch_slot: int | None        # 档位（如 4/8/16）
-    admission: AdmissionKind | None
-    lengths: dict[str, int]
-    beam_width: int | None        # 归档后的 beam 宽度（图 key 输入）
-    graph_keys: tuple[str, ...]   # 供 GraphStore 查询的图 key
-    request_count: int            # 真实请求数
-    padded_slots: int             # batch_slot - request_count（padding 记账）
-    beam_requests: dict[str, BeamRequestMeta]  # 每请求 beam 执行元数据
+    created_at: float = field(default_factory=time.time)
 ```
 
 ### 6.3 BucketInfo（路由结果）
@@ -288,10 +289,47 @@ class SchedulerBatchInfo:
 class BucketInfo:
     length_bucket: int
     beam_width: int
+```
+
+> `graph_keys` 不在 `BucketInfo` 里：它是在 `build_batch_info` 阶段按 `(长度桶, batch 档, beam 档)` 拼出来的，见 6.5。
+
+### 6.4 BeamRequestMeta（每请求 beam 执行元数据）
+
+```python
+@dataclass(frozen=True)
+class BeamRequestMeta:
+    beam_width: int
+    is_beam_decode: bool = True
+    beam_decode_steps: int = 0
+    prefix_len: int = 0
+    cache_len: int = 0
+```
+
+### 6.5 RequestBatchInfo（每请求批次信息）
+
+```python
+@dataclass(frozen=True)
+class RequestBatchInfo:
+    batch_id: str
+    bucket: int
+    batch_slot: int
+    beam_width: int
+    admission: AdmissionKind
+    length: int
+    padded_slots: int
     graph_keys: tuple[str, ...]
 ```
 
-> `beam_decode_steps` 不在批间传递：它是引擎启动配置（`SchedulerPluginConfig.beam_decode_steps`）固定的值。
+### 6.6 SchedulerBatchInfo（调度层输出，挂在 `SchedulerOutput`）
+
+```python
+@dataclass(frozen=True)
+class SchedulerBatchInfo:
+    requests: dict[str, RequestBatchInfo] = field(default_factory=dict)
+    beam_requests: dict[str, BeamRequestMeta] = field(default_factory=dict)
+```
+
+> `beam_decode_steps` 不在批间传递：它是引擎启动配置（`SchedulerPluginConfig.beam_decode_steps`）固定的值；`BeamRequestMeta.beam_decode_steps` 仅为 worker 旧管线兼容保留。
 
 ---
 
@@ -502,5 +540,4 @@ stateDiagram-v2
 | 批内 beam 不一致 | 组批混 beam 拒绝；FIFO 按 (bucket, beam_width) 分队列 |
 | 长度 bucket 覆盖不全 | 配置外请求报错；上线前按流量统计配置 |
 | 物理 pad 占 token 预算 | 默认图级 padding（metadata）；物理 pad 仅 kernel 不支持变长时用 |
-| 超长 prefill 打爆图 / KV | `max_prefill_len` + `prefill_policy`（`error` / `single`）fail-fast |
-| 长 prompt 拉高 padding / 图尺寸 | 长度分桶 + 固定档位图；超长按 `prefill_policy` fail-fast（`error`/`single`） |
+| 超长 / 长 prompt 打爆图与 KV、拉高 padding | 长度分桶 + 固定档位图；超过 `max_prefill_len` 按 `prefill_policy`（`error`/`single`）fail-fast |

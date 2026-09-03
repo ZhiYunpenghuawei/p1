@@ -1,0 +1,6 @@
+1、本身vllm的调度会对长输入切分，max_num_batched_tokens，max_num_seqs分别为最长计算的token数，以及最多的reqs数，默认是贪心，一个长请求会把max_num_batched_tokens全占用
+可以通过long-prefill-token-threshold 2048这个参数设置长请求不要一次全部占用。
+所以可以通过改变参数来控制padding的大小，不用非要把长度设置的很小
+
+2、目前的prefill_graph的逻辑是多个请求拼接起来，padding到bucket【128，256，512，1024，2048】
+3、

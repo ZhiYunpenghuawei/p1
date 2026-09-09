@@ -156,16 +156,6 @@ export VLLM_ENABLE_PREFILL_CUDAGRAPH=0
 - 区分 tie 行为、现有不稳定性与 replay 引入的缺陷。
 - 在声称"正确性保持的收益"前，先解决 512/5K/8K 的不一致问题。
 
-### 5.4 🟡 缺少可复现基准脚本
-
-审查要求提供：
-
-- 可触发 graph replay 的 eligible workload 脚本
-- 同版本 head 的 `VLLM_ENABLE_PREFILL_CUDAGRAPH=0/1` 对比
-- 精确的 revision、硬件/软件版本、模型/tokenizer、prompt 构造、seed、精度、beam width、并发度
-- Warmup 与 cache reset 流程、原始 per-request 测量值、中位数/方差
-- 明确 "prefill latency" 的定义边界（GPU 执行 / host+device forward / 前端等待）
-
 ---
 
 ## 7. 结论

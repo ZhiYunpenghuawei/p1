@@ -100,41 +100,25 @@ session_id == batch_id == native request_id
 原生 vLLM 的异步模式通过 `batch_queue` 保存 `(Future, SchedulerOutput)`：CPU 调度一个 batch 后，以 `non_block=True` 发给 Worker；在队列未满时继续准备下一 batch，队列达到容量后再回收最老 Future。当前 GR V1 复用这条链路。
 
 ```mermaid
-sequenceDiagram
-    participant FE as Frontend
-    participant EC as EngineCore
-    participant SCH as Native Scheduler + GR Hook
-    participant Q as batch_queue
-    participant GPU as Worker/GPU
-
-    FE->>EC: submit(session, Request) 一次
-    EC->>SCH: schedule()
-    SCH->>SCH: issue stage 0 / Prefill
-    SCH-->>EC: SchedulerOutput(F0 + metadata)
-    EC->>GPU: execute_model(F0, non_block)
-    EC->>Q: enqueue Future(F0)
-
-    Note over EC,GPU: F0 仍在 GPU 执行，CPU 可继续调度
-    EC->>SCH: schedule()
-    SCH->>SCH: issue stage 1 / Decode<br/>依赖 stage 0 device ref
-    SCH-->>EC: SchedulerOutput(D1 + metadata)
-    EC->>GPU: execute_model(D1, non_block)
-    EC->>Q: enqueue Future(D1)
-
-    Note over SCH,Q: outstanding 达到 2，暂不再发该 session
-    Q-->>EC: reap Future(F0)
-    EC->>SCH: update_from_output(F0 control result)
-    SCH->>SCH: completed += 1，重新开放一个槽位
-    EC->>SCH: schedule next Decode
-
-    loop 直到最后一个 stage
-        GPU->>GPU: forward + Beam advance，状态留在设备端
-        GPU-->>EC: GRWorkerResult 控制完成信息
-    end
-
-    GPU->>GPU: pack final Beam tensors
-    GPU->>EC: 最终一次 D2H + gr_batch_result
-    EC-->>FE: terminal result
+flowchart TD
+    A["前端只提交一次 Request"] --> B["Scheduler 发射 Prefill F0"]
+    B --> C["Worker 非阻塞执行 F0"]
+    C --> D["Future F0 进入 batch queue"]
+    D --> E["F0 尚未被 CPU 回收时，Scheduler 继续工作"]
+    E --> F["发射下一 Decode stage，依赖前一 stage 的 device state"]
+    F --> G["Worker 非阻塞执行 Decode，并在 GPU 上推进 Beam"]
+    G --> H["Decode Future 进入 batch queue"]
+    H --> I{"该 session 的 outstanding stage 是否达到 2"}
+    I -- "是" --> J["暂停发射该 session"]
+    I -- "否" --> K["继续回收最老 Future"]
+    J --> K
+    K --> L["更新 completed、placeholder 和控制状态"]
+    L --> M{"最后一个 stage 是否完成"}
+    M -- "否" --> N["开放一个发射槽位"]
+    N --> F
+    M -- "是" --> O["打包最终 Beam tensors"]
+    O --> P["执行一次 D2H"]
+    P --> Q["返回 terminal gr_batch_result"]
 ```
 
 ### 4.1 发射窗口
@@ -334,4 +318,3 @@ issued <= completed + 2
 - `vllm_gr/v1/worker/gr_persistent_beam.py`：GPU 常驻 Beam session。
 - `vllm_gr/v1/worker/gr_beam_output.py`：最终结果打包与单次 D2H。
 - `tests/test_gr_async_scheduler.py`：Prefill/Decode lookahead、提前结束和 chunked prefill 的状态机断言。
-

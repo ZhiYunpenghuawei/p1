@@ -1,6 +1,30 @@
 # Beam Search V1 A3 修改说明
 
+todo：
+1. GRWorkerResult
+现在的 produced_token_count、device_state、finished 有重复信息。建议用一个 outcome 表示继续、结束或失败。
+2. GRStageCompletion
+目前返回后没人使用，状态已经直接写进 Session，可以删除，让 update_gr_from_output() 返回 None。
+3. Session 的三个计数
+output_placeholders、pending_device_token_count、confirmed_token_count 基本没有参与调度判断，可以删除或只保留一个统计值。
+4. max_decode_steps
+可以直接由 beam_params.max_tokens 推导，没有必要单独保存。
+5. terminal_result_pending
+与 status、_pending_terminal_result 重复。可以规定进入 FINISHING 就必须有最终结果或 failure，然后删除这个布尔值。
+6. GRStageMetadata
+decode_step 和 is_last_stage 都可以通过 stage_index 计算，可以删除。
+7. 重复发送 Session 配置
+beam_params、output_options 和 num_prompt_tokens 每个 Stage 都会发送。应该只在第一个 Dispatch 通过轻量 session_init 发送一次。
+8. 未使用的接口
+reserve_gr_output_placeholder()、Scheduler 侧的 finish_gr_session()/release_gr_session() 以及三个 Protocol 当前没有实际调用，可以清理。
+9. 两条终态结果通道
+GRWorkerResult.terminal_result 和 ModelRunnerOutput.gr_batch_results 表达同一件事，应该只保留一条。
+10. 注释名称过期
+注释中的 gr_v1_stages/gr_v1_results 与实际的 gr_stage_metadata/gr_worker_results 不一致，需要统一。
+
 ## 1. A3 整体做了什么
+
+
 
 A2 已经完成 Beam Search V1 的前端请求模型：
 

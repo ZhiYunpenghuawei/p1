@@ -146,7 +146,7 @@ BeamBatchResult → 离线/在线公共输出
 | 请求外完整物化平均耗时 | 4.955 ms | 3.311 ms |
 | 请求加完整物化平均耗时 | 113.270 ms | 61.478 ms |
 
-Profiling 文件： [待插入 profiling 链接]()
+Profiling 文件： [https://github.com/ZhiYunpenghuawei/p1/tree/main/profiling]()
 
 以上结果仅代表当前本地环境，最终数据应以目标机器上的独立复测为准。
 

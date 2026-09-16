@@ -31,6 +31,74 @@ GPU D0      || CPU 准备 D1
 4. 一个请求完成后，必须由 Worker 明确证明资源已经释放，Scheduler 才能运行下一个请求。
 
 ## 2. 整体分层
+## 2. 设计总览图
+
+本节先用图展示完整设计。后续章节再分别解释 EngineCore/Scheduler 层和 Worker 层。
+
+### 2.1 总体分层架构
+
+```mermaid
+flowchart TD
+    C[Client / Frontend] -->|ADD request| E[EngineCore]
+
+    subgraph ES[EngineCore / Scheduler 层]
+        E --> A[GR Admission]
+        A --> F[FIFO Session Queue]
+        F --> O[Single Execution Owner]
+        O --> S[Native Async Scheduler]
+        S --> Q[Native BatchQueue]
+        R[Receipt Consumer] --> S
+        S --> T[Retirement Controller]
+    end
+
+    subgraph WK[Worker 层]
+        Q --> W[Persistent GR Worker]
+        W --> CP[CPU Input Preparation]
+        CP --> H[Two Pinned Host Slots]
+        H --> DB[Stable Device Buffers]
+        DB --> X[Prefill / Decode Execution]
+        X --> B[Persistent GPU Beam State and KV]
+        B --> X
+        X --> CR[Async Control Receipt]
+        T --> RT[Worker Resource Retirement]
+    end
+
+    CR --> R
+    RT -->|Release Proof| T
+    T -->|Owner Closed| F
+```
+
+分层职责：
+
+- **EngineCore/Scheduler 层**：请求准入、FIFO owner、阶段调度、KV 生命周期、回执消费和资源退休。
+- **Worker 层**：CPU 输入准备、H2D、设备状态绑定、Forward、Beam 更新、控制回执和资源释放。
+
+### 2.2 一个请求的端到端主流程
+
+```mermaid
+flowchart TD
+    A[收到 Beam Search V1 ADD] --> B{准入校验通过?}
+    B -->|否| X[当前请求返回 ERROR]
+    B -->|是| C[执行 native ADD]
+    C --> D[注册到 GR FIFO]
+    D --> E{Owner 是否空闲?}
+    E -->|否| F[保持 WAITING]
+    E -->|是| G[成为 RUNNING Owner]
+    G --> H[预留 P + N - 1 KV extent]
+    H --> I[提交 Prefill]
+    I --> J[提交 Decode 0 / Decode 1]
+    J --> K[消费每个 Dispatch Receipt]
+    K --> L{请求结束/取消/失败?}
+    L -->|否| J
+    L -->|是| M[DRAINING]
+    M --> N[发送 Zero-token Retirement Frame]
+    N --> O[Worker 排空并释放资源]
+    O --> P[返回匹配的 Release Proof]
+    P --> Q[CLOSED]
+    Q --> R[下一个 FIFO Session 成为 Owner]
+```
+
+### 2.3 Scheduler 双 Dispatch Slot 流程
 
 ```mermaid
 flowchart LR
@@ -43,12 +111,94 @@ flowchart LR
     R --> S
     S -->|Retirement frame| W
     W -->|Release proof| S
+    P[Prefill] -->|使用| S0[Slot 0]
+    D0[Decode 0] -->|使用| S1[Slot 1]
+    S0 --> R0[Prefill Receipt]
+    S1 --> R1[D0 Receipt]
+    R0 --> C0[EngineCore 消费]
+    C0 --> F0[释放 Slot 0 和 KV Lease]
+    F0 --> D1[Decode 1 使用 Slot 0]
+
+    subgraph Window[任意时刻最多两个 Physical Dispatch 在途]
+        S0
+        S1
+    end
 ```
 
 整个方案分成两层：
+两个 slot 表示单个 owner 的两级 look-ahead，不表示两个 session 可以并行占用共享 Beam scratch。
 
 - **EngineCore/Scheduler 层**：负责请求准入、FIFO owner、阶段调度、KV 生命周期、回执消费和资源退休。
 - **Worker 层**：负责 CPU 输入准备、H2D、设备状态绑定、Forward、Beam 更新和资源释放。
+### 2.4 Worker 内部执行流水线
+
+```mermaid
+flowchart TD
+    A[收到 SchedulerOutput + GRStageMetadata] --> B{Stage 类型}
+    B -->|Prefill| P1[Native/Graph Prefill Forward]
+    P1 --> P2[Sample]
+    P2 --> P3{最终 Prefill Chunk?}
+    P3 -->|否| RC[生成 produced=0 Receipt]
+    P3 -->|是| BI[初始化 GPU Beam State]
+
+    B -->|Decode| C1[CPU prepare Layout]
+    C1 --> C2[Pinned Slot]
+    C2 --> C3[Async H2D 到固定 Device Buffer]
+    C3 --> C4[绑定 GPU Token / Mask / Step]
+    C4 --> D1[Decode Forward]
+
+    BI --> U[Constraint Candidate Selection]
+    D1 --> LM[LM Head]
+    LM --> U
+    U --> BA[Beam Advance]
+    BA --> KV[Parent KV Reorder]
+    KV --> CS[写 Control Snapshot]
+    CS --> CD[Copy Stream 异步 D2H]
+    CD --> RC[构造 GRWorkerResult]
+```
+
+### 2.5 Owner 生命周期
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING: Native ADD 成功并进入 FIFO
+    WAITING --> RUNNING: 获得 Owner + Generation
+    RUNNING --> DRAINING: Finish / Abort / Failure
+    DRAINING --> RETIRING: Dispatch、Receipt、Terminal Delivery 已排空
+    RETIRING --> CLOSED: 收到匹配的 Worker Release Proof
+    CLOSED --> [*]: 允许下一个 FIFO Owner
+
+    WAITING --> CLOSED: 未分配 Worker 资源即取消
+    RETIRING --> RETIRING: 无效/过期 Proof，不释放 Owner
+```
+
+生命周期的核心原则是：**逻辑请求结束不等于 Worker 资源已经释放。**
+
+### 2.6 Prefill → D0 → D1 异步时序
+
+```mermaid
+sequenceDiagram
+    participant E as EngineCore/Scheduler
+    participant W as Worker CPU
+    participant G as GPU Compute
+    participant C as Output Consumer
+
+    E->>W: Dispatch Prefill using Slot 0
+    W->>G: Enqueue Prefill Forward + Sample + Beam Init
+    E->>W: Dispatch D0 using Slot 1
+    W->>W: prepare_cpu(D0)
+    Note over W,G: CPU prepare(D0) overlaps GPU Prefill
+    W->>G: Upload + Bind + Enqueue D0
+    G-->>C: Prefill Control D2H
+    C-->>E: Consume Prefill Receipt, release Slot 0
+
+    E->>W: Dispatch D1 using Slot 0
+    W->>W: prepare_cpu(D1)
+    Note over W,G: CPU prepare(D1) overlaps GPU D0
+    W->>G: Upload + Bind + Enqueue D1
+    G-->>C: D0 Control D2H
+    C-->>E: Consume D0 Receipt, release Slot 1
+```
 
 ## 3. EngineCore / Scheduler 层设计
 
@@ -502,6 +652,10 @@ stateDiagram-v2
     RETIRING --> CLOSED: 收到匹配的 Worker release proof
     CLOSED --> [*]
 ```
+完整生命周期见前文“2.5 Owner 生命周期”。这里重点说明两个边界：
+
+- `RUNNING → DRAINING` 只表示不再产生新的有效业务阶段，已提交的 dispatch 和 terminal delivery 仍需排空。
+- `RETIRING → CLOSED` 必须依赖 Worker 返回的匹配 proof，不能由 Scheduler 根据本地状态自行推断。
 
 ### 7.3 Retirement 流程
 

@@ -53,7 +53,8 @@ flowchart TD
 
     subgraph WK[Worker 层]
         Q --> W[Persistent GR Worker]
-        W --> CP[CPU Input Preparation]
+        W --> RB[First-dispatch Resource Binding]
+        RB --> CP[CPU Input Preparation]
         CP --> H[Two Pinned Host Slots]
         H --> DB[Stable Device Buffers]
         DB --> X[Prefill / Decode Execution]
@@ -84,9 +85,11 @@ flowchart TD
     D --> E{Owner 是否空闲?}
     E -->|否| F[保持 WAITING]
     E -->|是| G[成为 RUNNING Owner]
-    G --> H[预留 P + N - 1 KV extent]
-    H --> I[提交 Prefill]
-    I --> J[提交 Decode 0 / Decode 1]
+    G --> H[Scheduler 预留 P + N - 1 KV extent]
+    H --> I[提交首次 Prefill + Session Metadata]
+    I --> WB[Worker 创建/复用 Runner 并绑定 State、KV、Workspace Slot]
+    WB --> PF[执行 Prefill 并初始化 Beam State]
+    PF --> J[提交 Decode 0 / Decode 1]
     J --> K[消费每个 Dispatch Receipt]
     K --> L{请求结束/取消/失败?}
     L -->|否| J
@@ -253,6 +256,85 @@ owner 独占：
 每次分配 owner 都增加 `owner_generation`。即使复用了相同 session ID，旧请求的延迟回执也无法释放新请求资源。
 
 ### 3.3 两个 dispatch slot
+### 3.3 首次资源申请与绑定
+
+资源申请不是通过一个与 retirement 对称的独立 allocate frame 完成，而是分三个时间点完成。
+
+```mermaid
+sequenceDiagram
+    participant ST as Engine Startup
+    participant S as Scheduler
+    participant W as Worker
+    participant G as GPU Resources
+
+    ST->>G: 创建 Beam Context、Workspace、固定 Buffer、Graph Storage
+    S->>S: Owner Admission
+    S->>S: Native allocate_slots，预留 P + N - 1 KV
+    S->>W: 首次 Prefill SchedulerOutput + Session Metadata
+    W->>W: get_stage_runner()
+    W->>G: 创建或复用 GPUBeamStageRunner
+    W->>G: 绑定 State Row、KV Slot、Workspace Row
+    W->>G: 初始化该 Session 的 Beam State
+    Note over S,G: 此后该 Session 成为 Worker 资源的唯一 Owner
+```
+
+#### 3.3.1 启动期预分配
+
+engine/Worker 启动时已经创建大部分可复用资源：
+
+- Beam context 和 registry；
+- Beam state pool；
+- candidate workspace；
+- Beam KV pool 和共享 scratch；
+- Decode 固定输入 buffer；
+- startup capture 使用的 Graph storage。
+
+这些资源通常不是每个请求重新申请和销毁，而是在 engine 生命周期内保留。
+
+#### 3.3.2 Scheduler 首次申请 Native KV
+
+session 成为 owner 后，Scheduler 在第一次 native KV allocation 中调用 `allocate_slots()`，通过 `num_lookahead_tokens` 预留完整的 `P + N - 1` extent。
+
+这一层申请的是 native paged KV 容量，发生在 Scheduler 侧，不是 Worker 发起的设备控制命令。
+
+#### 3.3.3 Worker 首次绑定 Session 资源
+
+Scheduler 不发送单独的 allocate frame，而是在首次 Prefill dispatch 中携带 session metadata。Worker 收到后通过 `get_stage_runner()`：
+
+1. 校验 session identity、Beam 参数和执行容量。
+2. 创建新的或复用已经关闭的 `GPUBeamStageRunner`。
+3. 从现有 registry/pool 中取得并绑定 state row、Beam KV slot、workspace row。
+4. 将 execution owner 写入 Beam context 和 workspace。
+5. 最终 Prefill sampling 完成后初始化该 session 的 GPU Beam state。
+
+因此，首次 Prefill 同时承担两件事：
+
+```text
+首次 Prefill = 正常模型阶段 + Worker Session 资源绑定入口
+```
+
+#### 3.3.4 Retirement 释放的是什么
+
+retirement 通常不是释放整块 GPU 内存，而是：
+
+- 等待该 session 的 dispatch、control consumer 和 GPU work 排空；
+- 结束 Beam session；
+- 释放/归还 state row、KV slot、workspace row；
+- 清除 context/workspace 的 execution owner；
+- 向 Scheduler 返回匹配的 release proof。
+
+兼容的固定输入 buffer 和 Graph storage 可以继续保留，供下一个 session 复用。
+
+所以完整关系是：
+
+```text
+Engine Startup：预分配资源池和固定 Buffer
+首次 Scheduler Allocation：预留 Native KV
+首次 Prefill：Worker 绑定 Session 到资源池中的 Slot
+Retirement：解除 Session Ownership，并归还 Slot
+```
+
+### 3.4 两个 dispatch slot
 
 每个 owner 最多允许两个 physical dispatch 在途。
 
@@ -275,6 +357,7 @@ T3：D1 使用 slot 0
 两个 slot 的目的不是让两个 GPU 阶段并行，而是让后一个阶段在前一个 receipt 返回 EngineCore 之前进入 Worker，从而提前执行 CPU preparation。
 
 ### 3.4 Logical stage 与 physical dispatch
+### 3.5 Logical stage 与 physical dispatch
 
 一次 logical stage 代表产生一个生成 token；一次 physical dispatch 代表一次 SchedulerOutput/Worker 调用。
 
@@ -301,6 +384,7 @@ D0：dispatch 2，stage 1，produced=1
 - 非最终 Prefill chunk 不增加输出占位符。
 
 ### 3.5 KV 预留
+### 3.6 KV 预留
 
 Scheduler 第一次为 owner 分配 KV 时，直接预留完整生成过程需要的逻辑空间：
 
@@ -317,6 +401,7 @@ KV extent = P + N - 1
 - 已经开始生成后预留容量丢失：视为内部错误。
 
 ### 3.6 Per-dispatch KV lease
+### 3.7 Per-dispatch KV lease
 
 完整预留保证未来容量，dispatch lease 保证已经提交的 GPU 工作安全。
 
@@ -325,6 +410,7 @@ KV extent = P + N - 1
 因此，即使 native request 因完成、取消或其他原因释放了自己的 block 引用，已经排队的 GPU 工作仍不会读到被其他请求复用的 block。
 
 ### 3.7 Scheduler 发出阶段
+### 3.8 Scheduler 发出阶段
 
 Scheduler 为每个 dispatch 附加 `GRStageMetadata`，包括：
 
@@ -338,6 +424,7 @@ Scheduler 为每个 dispatch 附加 `GRStageMetadata`，包括：
 Worker 必须在 receipt 中返回关键 identity。Scheduler 不接受缺失、错误 generation、错误 dispatch ID 或错误 stage index 的回执。
 
 ### 3.8 Scheduler 消费回执
+### 3.9 Scheduler 消费回执
 
 Worker 每个 dispatch 返回：
 

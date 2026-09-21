@@ -955,6 +955,30 @@ local_parent = global_parent - i * W
 
 转换后不在 `[0, W)` 范围内，说明出现跨 Request parent，整个 cohort 失败。
 
+这里包含两种不同性质的操作：
+
+1. suffix KV 的 `[B, W, ...] -> [B * W, ...]` 使用 `view/reshape` 建立零拷贝
+   Tensor 视图，只修改 Host 侧 Tensor metadata，不搬运设备数据，也不启动
+   NPU kernel；只要底层存储连续，这部分延迟通常可以忽略；
+2. PR #411 的 `global_parent -> local_parent` 在最终结果已经搬到 Host 后，由
+   `split_batch_decision()` 对 Python 列表做减法和范围校验。计算本身很小，但
+   其前面的 D2H 同步和 Tensor `tolist()` 不属于零成本操作。
+
+对于本文方案，如果单个 Decode stage 的额外预算要求小于 0.5 ms，应采用：
+
+- steady Decode step 只创建/复用固定视图，不复制 suffix KV；
+- parent offset 在已有 Beam decision/KV reorder kernel 内融合完成，或继续保留
+  global parent 供设备侧消费；
+- 非 terminal step 不做完整 parent/sequence D2H 和 Python `tolist()`；
+- terminal step 才拆分 Host 结果；
+- `(B, W)` graph 不匹配时不能静默回退 eager，因为 graph fallback 的额外延迟
+  通常比 layout view 更值得关注；
+- 对 layout、parent localization、KV reorder、D2H 和 Host split 分别打点，
+  用设备 event 与 Host 单调时钟验证 0.5 ms 预算。
+
+因此 0.5 ms 的主要风险不是 `[B, W]` 与 `[B * W]` 的视图转换，而是额外的
+同步、拷贝、Host materialization 和 graph fallback。
+
 ### 15.6 PR #411 的 Decode Graph
 
 PR #411 启动时按配置的最大容量构造 dummy cohort：
@@ -1009,7 +1033,169 @@ request B：仍在执行 Prefill chunk
 由同一个 BatchSession 管理，并显式记录 `active_prefill_requests`，全部完成后
 才整体进入 Decode。
 
-### 15.8 PR #411 与本文 BatchSession 方案的区别
+### 15.8 PR #411 的完整同步 Decode 数据流
+
+下面这张图按 PR #411 当前 NPU 路径标出了主要 Host/Device 边界：
+
+```mermaid
+sequenceDiagram
+    participant F as Frontend/CPU
+    participant E as EngineCore/Scheduler
+    participant W as NPU Worker CPU
+    participant D as NPU Device
+    participant G as Decode Graph
+
+    F->>E: 发送 B 个 BeamStepUpdate
+    E->>E: BEAM_STEP_BATCH barrier<br/>收齐 B 个成员
+    E->>W: SchedulerOutput(B 个独立 Request)
+
+    W->>W: 构造 row map、metadata、logits_indices
+    W->>D: H2D：输入/positions/slot/seq_len 等<br/>（部分增量索引可 device arange）
+    W->>G: replay(num_tokens=B×W)
+    G->>D: Model Forward + Beam Attention
+    D-->>W: device logits/hidden
+    W->>D: device sampler + Beam decision
+    D->>D: 更新 sequence/score/KV reorder 状态
+
+    D-->>W: D2H：out_token_ids/out_parent/out_log_probs
+    W->>W: detach().to(cpu).tolist()
+    W->>W: split_batch_decision()<br/>global parent -> local parent
+    W-->>E: B 个 request-local 同步结果
+    E-->>F: host output / bookkeeping
+    F->>F: 组装下一轮 B 个 step update
+    Note over F,D: 下一轮必须等待本轮 Host 结果，形成 CPU 控制往返
+```
+
+按阶段展开，PR #411 的数据流是：
+
+1. **Batch update 是 Host 控制消息**：Frontend 为 B 个 Request 生成各自的
+   `BeamRequestStepUpdate`，通过 `BEAM_STEP_BATCH` 发送到 EngineCore；
+2. **EngineCore 只做 barrier，不把 batch 变成一个设备 session**：它记录
+   expected/pending 成员，收齐后仍向 Scheduler 注册 B 个独立 Request；
+3. **Worker 准备输入**：`_beam_remap_inputs()` 生成 B×W 的 row mapping、
+   positions、logits indices 和 sampling metadata。增量 Decode 的 position
+   可以直接写 device buffer，连续 logits index 可以用 device `arange`；非连续
+   index、普通输入和部分 metadata 仍可能走 Host→Device copy；
+4. **图内执行**：Decode Graph 只覆盖 Model Forward/Beam Attention。它读取
+   固定地址的 device input、KV 和 metadata，图本身不把 Beam 结果返回 Host；
+5. **图外 Beam decision**：采样和 `run_beam_decision()` 在 device 上执行，
+   更新 device sequence、score 和 KV 相关状态；
+6. **同步结果回传**：当前 PR 的 NPU 兼容路径会对 decision tensor 执行
+   `value.detach().to("cpu").tolist()`，至少把 `out_token_ids`、
+   `out_token_index`、`out_log_probs` 搬回 Host，terminal step 还包括
+   `out_sequence`；
+7. **Host 拆分和路由**：`split_batch_decision()` 在 CPU 上做 global parent
+   到 local parent 的转换，并生成 B 个 request-local payload；
+8. **下一轮重新下发**：同步 bookkeeping 和 Frontend 消费 Host 结果，重新组装
+   下一轮 B 个 step update，再回到 EngineCore barrier。
+
+数据搬运边界可以直接看成下面这条链路：
+
+```text
+Frontend 发送 B 个 update
+    ↓
+EngineCore 收齐 cohort
+    ↓
+Scheduler 管理 B 个独立 Request
+    ↓
+Worker 构造 B×W 输入
+    ↓
+H2D：输入、positions、slot、seq_len 等
+    ↓
+Decode Graph：Model Forward + Beam Attention
+    ↓
+Device sampler + Beam decision
+    ↓
+D2H：token、parent、score
+    ↓
+CPU tolist()
+    ↓
+CPU split_batch_decision()
+    ↓
+返回 B 个 request-local 结果
+    ↓
+Frontend 重新构造下一轮 update
+```
+
+简单说：
+
+- Graph 和 Beam decision 中间主要在 device 上执行；
+- 每轮 decision 之后，PR #411 会把结果 D2H 到 CPU；
+- CPU 做 `tolist()`、parent 拆分和结果路由；
+- 下一轮必须等 CPU 结果回来后才能继续下发。
+
+所以 PR #411 虽然有 device-resident Beam state，但控制链路仍是同步的：
+
+```text
+Device → Host → CPU 处理 → 下一轮下发
+```
+
+这就是它和当前“Device 持久化、Host 只收 ACK、CPU 不等待完整结果”设计的
+根本区别。
+
+这里的关键不是有没有 device-resident Beam buffer，而是每个 Decode step 都有
+一条强制的：
+
+```text
+Device decision -> D2H -> CPU split/bookkeeping -> Host protocol -> 下一轮
+```
+
+所以 PR #411 属于“设备上保存 Beam 状态、Host 上驱动同步 step”的方案，不是
+“设备状态自推进、Host 只收 ACK”的异步方案。
+
+### 15.9 PR #411 与当前 device-persistent 异步模型的冲突
+
+你们当前模型要求：
+
+```text
+CPU 下发 stage N
+    -> 不等待完整结果
+    -> CPU 准备 stage N+1
+    -> Device 依赖和 stream/event 保证顺序
+    -> Host 只接收轻量 ACK/terminal proof
+```
+
+而 PR #411 是：
+
+```text
+CPU 下发 stage N
+    -> 等待 sampler/decision 结果回到 Host
+    -> CPU 做 parent/result 拆分
+    -> CPU 重新构造 stage N+1 的 Request update
+    -> 再下发 stage N+1
+```
+
+因此，PR #411 不能直接作为当前异步 device-persistent 路径的实现。即使它
+复用了 device Beam context，下面几处仍然会打破无 bubble 逻辑：
+
+- NPU decision 后的每步 D2H；
+- NPU 路径上的 `tolist()` 和 Host result materialization；
+- Frontend/EngineCore 对下一轮 Request update 的重新注册；
+- Host 侧 global/local parent 处理；
+- 同步 bookkeeping 对 sampled/logprob 的 Host 复制；
+- 下一轮 Decode 依赖上一轮 Host 消费完成。
+
+如果要把 PR #411 的 `B×W` 执行布局迁移到当前异步模型，只能提取这些部分：
+
+```text
+Batch capacity
+BeamExecutionBatch 的 row mapping
+suffix KV 的 B×W view
+一次 batch Beam decision
+request-local 结果映射规则
+```
+
+不能直接提取它的同步控制链路和每步 Host result transport。当前异步版本应
+改为：
+
+```text
+device sequence/score/parent 持久化
+    -> device 侧直接生成下一步 input_ids
+    -> 下一阶段只传 batch ACK / terminal proof
+    -> terminal 时才做一次 compact D2H
+```
+
+### 15.10 PR #411 与本文 BatchSession 方案的区别
 
 | 维度 | PR #411 | 本文 BatchSession 方案 |
 | --- | --- | --- |
@@ -1052,7 +1238,7 @@ flowchart TB
     end
 ```
 
-### 15.9 两种方案的主要取舍
+### 15.11 两种方案的主要取舍
 
 PR #411 的优点是改动相对局部：保留现有 Request、Scheduler 和 Session 模型，
 只在 Decode 入口增加 cohort barrier，并在 Worker 增加执行视图。B=1 兼容成本

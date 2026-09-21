@@ -1,6 +1,98 @@
 # Decode Graph 多 Batch 设计方案
 
-## 1. 目标
+本文按两个方案分别说明，避免把 PR #411 的同步 cohort 方案和当前要设计的
+BatchSession 方案混在一起：
+
+```text
+第一部分：PR #411
+  Scheduler：B 个独立 Request + cohort barrier
+  Worker：临时 BeamExecutionBatch，展开 B×W 执行
+  主要问题：每步 decision 需要 D2H/CPU materialization，不能满足 Host 只收 ACK
+
+第二部分：当前 BatchSession 方案
+  Scheduler：一个 Batch 作为唯一调度单位
+  Worker：一个 Batch stage 作为事务，整批 prepare/execute/commit
+  目标：Beam/KV/下一步输入尽量留在 Device，Host 只处理 ACK 或 terminal 结果
+```
+
+## 0. 第一部分：PR #411 的设计拆解
+
+### 0.1 Scheduler 层：cohort barrier，而不是 Batch Request
+
+PR #411 的调用方仍然为每个 Request 发送独立的 step update，只是给它们附加
+相同的 cohort 信息：
+
+```text
+Frontend
+  ├── BeamRequestStepUpdate(request A, step=N, cohort=C)
+  ├── BeamRequestStepUpdate(request B, step=N, cohort=C)
+  └── BeamRequestStepUpdate(request C, step=N, cohort=C)
+                 ↓
+EngineCore 收集 pending[C]
+                 ↓
+收齐 B 个成员后，一起进入 Scheduler
+```
+
+它解决的是“不能让 cohort 内某个 Request 先跑”的问题，但 Scheduler 内部仍
+看到 B 个独立 Request，而不是一个拥有统一生命周期的 Batch。其核心保证是：
+
+- cohort 成员数达到预期后才放行；
+- 成员顺序、Beam width、decode step 和 slot 必须一致；
+- cohort 不能和普通请求混排；
+- 成员不支持中途加入、退出或替换。
+
+`beam_engine_driven` 开启时，EngineCore 可以在收到本轮 Host decision 后，在
+内部构造下一轮 update，减少 Frontend RPC；关闭时则由 Frontend 处理结果并发送
+下一轮 update。这个开关改变的是“谁发起下一步”，不改变 PR #411 的 Request
+级 Session 所有权。
+
+### 0.2 Worker 层：临时执行视图 + 一次 B×W 计算
+
+Worker 收到 B 个独立 Request 后，临时构造 `BeamExecutionBatch`：
+
+```text
+BeamSession A ─┐
+BeamSession B ─┼─> BeamExecutionBatch view ─> 一次 Attention/Forward/Decision
+BeamSession C ─┘                 物理行数 = B × W
+```
+
+Worker 的主要流程是：
+
+1. 按 Scheduler 顺序找到 B 个独立 BeamSession；
+2. 检查 slot 是否连续、W/step 是否一致；
+3. 建立 `request_index * W + beam_index` 的物理行映射；
+4. 将 input、position、logits index 和 sampling metadata 展开为 B×W；
+5. 复用一次 Model Forward、Attention 和 Beam decision；
+6. 在 Device 上更新 sequence、score 和 KV reorder 状态；
+7. 将 decision tensor D2H，执行 `tolist()`；
+8. CPU `split_batch_decision()`，把 global parent 转成 request-local parent；
+9. 通过原有结果通道返回 B 个 request-local 结果。
+
+这里的 suffix KV 展平通常只是连续 Tensor 的 view/reshape，不需要复制 Device
+数据；真正的额外成本在 decision 结果的 D2H、Host materialization 和 CPU 拆分。
+
+### 0.3 PR #411 的主要问题
+
+Scheduler 层的问题：
+
+- Batch 只是 barrier/cohort，不是统一的 BatchSession；
+- B 个 Request 仍分别注册、推进和清理，需要持续防止 step/slot/顺序漂移；
+- Prefill chunk 没有统一的 Batch 级生命周期和“全部完成后再 Decode”状态机；
+- `beam_engine_driven` 只能省 Frontend RPC，不能省 Host decision 依赖。
+
+Worker 层的问题：
+
+- 每个 decode step 都执行 `detach().to("cpu").tolist()`；
+- CPU 参与 global parent → local parent 转换和结果拆分；
+- 下一步输入依赖本步 Host decision，Device 不能自行产生下一步 token；
+- B 个独立 Session 的资源和状态不是一个事务，部分成功时容易产生半提交；
+- graph 主要按启动配置的总物理宽度 B×W 捕获，实际几何不匹配时可能回退 eager；
+- EOS、取消和异常不能只退出单个成员，否则会破坏固定 B×W 布局。
+
+因此，PR #411 可以复用的是 B×W 的执行布局、KV view 和一次 batch decision，
+不能直接复用它的 cohort 控制链路和每步 Host result transport。
+
+## 1. 第二部分：当前 BatchSession 设计目标
 
 调用方已经把多个 Beam 请求组成一个 batch 后再提交。运行时不负责动态组
 batch，也不负责把不同请求重新配对；运行时只需要把当前 decode-graph 的
@@ -189,7 +281,7 @@ request B -> rows 4, 5, 6, 7
 NPU 可以使用展平后的 `[B * W, ...]` 视图，但逻辑状态仍然按
 `[B, W, ...]` 归属到每个请求。
 
-## 6. Scheduler 层改动
+## 6. 当前方案的 Scheduler 层设计
 
 当前单请求逻辑大致是：
 
@@ -231,7 +323,24 @@ BeamBatchMetadata(
 单个请求 metadata 继续保存 request-local 信息，例如 prefix 长度、parent
 映射和 suffix 状态，不要把所有 Batch 状态复制到每个请求中。
 
-## 7. Worker/ModelRunner 层改动
+### 6.1 与当前代码的最小改动边界
+
+当前代码已经有 Batch 协议和异步 stage 基础设施，第一版不应另起一套调度器：
+
+- 复用 `BeamBatchPlan`、`BeamBatchResult` 和现有 batch contract 校验；
+- 复用 `GRStageMetadata` 的 `stage_index/dispatch_id/input_device_state/
+  output_device_state`，把单个 session 的引用扩展成 Batch 内有序成员集合；
+- 复用 `GRAsyncSchedulerInterface` 的 stage admission、look-ahead 和
+  retirement 机制；
+- 现有 `GRSessionState` 当前约束 `B=1`，只需新增一个 Batch 外层状态或把
+  `items` 从单项扩展为固定多项，不要重写 request 的 KV/session 生命周期；
+- 保留原有 `SchedulerOutput.gr_stage_metadata` 作为 Worker 入口，增加
+  `batch_id/request_ids/batch_size/beam_width` 的 Batch metadata。
+
+也就是说，改动重点是“Scheduler 如何一次选出同一 Batch 的多个 stage”，不是
+替换现有 Scheduler 或重做 vLLM 的 Request 管理。
+
+## 7. 当前方案的 Worker/ModelRunner 层设计
 
 Worker 侧增加一个 Batch 入口：
 
@@ -252,8 +361,10 @@ execute_beam_batch(scheduler_output, beam_batch_metadata)
 
 ### 7.1 Batch Session 是唯一执行 session
 
-本方案采用更简单的生命周期：**Session 以 Batch 为单位，而不是以单个
-Request 为单位**。
+本方案对外采用更简单的生命周期：**BatchSession 以 Batch 为执行单位**。实现
+上不要求删除当前每个 Request 的 session；可以保留现有 request-local session
+作为 BatchSession 的内部子对象，再由 Batch 层统一 admission、stage 提交和
+失败清理。
 
 ```text
 BatchSession
@@ -266,7 +377,7 @@ BatchSession
 ```
 
 Request 仍保留各自的 `request_id`、Beam score、sequence 和 KV 区域，但这些
-都是 `BatchSession` 内部的子状态。外部只管理一个 Batch session：
+都由 BatchSession 统一编排。外部只管理一个 Batch session：
 
 ```text
 CREATED -> PREFILLING -> DECODING -> TERMINAL -> RELEASED
@@ -409,6 +520,45 @@ valid rows     = actual_B * W
 
 BatchSession 统一拥有 Batch 内的 request 子状态。只有 Batch 完整 terminal
 或明确失败时，才由 Worker 统一释放所有 request 子状态、slot 和共享资源。
+
+### 7.7 Worker 侧的最小改动与设备持久化
+
+Worker 第一版应优先复用当前 `GPUBeamStageRunner`、`GRStageMetadata`、已有
+`_beam_remap_inputs()` 和现有 Beam decision kernel，只增加 Batch 适配层：
+
+```text
+现有单 session stage
+    -> BatchAdapter 收集并校验 B 个 session
+    -> 生成统一的 B×W row map
+    -> 复用现有 input/attention/graph/decision 路径
+    -> 按 row map 更新每个 session 的 device state
+```
+
+具体边界如下：
+
+1. **输入侧**：复用现有 input buffer 和 attention metadata 生成逻辑；只把
+   request-local 的 input、position、slot mapping 按固定 request 顺序拼成 B×W。
+   Decode steady state 不重新分配 Tensor，也不把 suffix KV 搬回 Host。
+2. **设备状态**：sequence、score、parent、KV pool 和 decode step 继续由现有
+   device context 持有。Batch 只保存 `request_index -> state/slot` 的映射，
+   不复制一份新的 Beam 状态。
+3. **Graph**：先支持一个精确的 `(B,W)` 几何，复用现有 graph capture/replay
+   入口；不在每轮请求中 capture，不因 shape 不匹配静默切 eager。
+4. **提交协议**：Worker 使用 `prepare -> execute -> validate -> commit`。
+   `prepare/execute` 只写临时 buffer；所有请求的 parent、shape、stage 和
+   device event 校验通过后，才一次性推进 Batch stage；失败后禁止重试并统一
+   释放资源。
+5. **Host 边界**：中间 Decode stage 只返回类似现有 `GRWorkerResult` 的
+   `dispatch_id/stage_index/device_state/finished` ACK。完整 token、parent、
+   score 和 sequence 只在 terminal 或显式 debug 模式 D2H。
+6. **异步依赖**：下一 stage 的 `input_device_state` 指向上一个 stage 的
+   `output_device_state`，通过同一 stream/event 保证先后顺序。CPU 可以在不等
+   完整 decision 的情况下准备下一阶段的 metadata；设备负责消费持久化状态。
+7. **兼容路径**：B=1 继续走当前单 session 路径，BatchAdapter 对 B=1 应是
+   零额外语义变化；只有 B>1 才启用 B×W 展开和 Batch 级校验。
+
+这样实现的关键不是把当前 `GPUBeamStageRunner` 改写成全新的 Batch runner，
+而是在它外面增加一个固定顺序、固定容量、整批提交的适配层。
 
 ## 8. KV 和 Beam 状态
 
@@ -841,13 +991,16 @@ Batch(A, B) 的 B 结果
 
 ## 14. 推荐实现顺序
 
-1. 增加 `BeamBatchMetadata` 和固定的 `request_index -> physical_row` 映射；
-2. 将 Scheduler 的单请求 Decode 输出改成 Batch 级输出；
-3. 在 Worker 增加 `execute_beam_batch()`，先完成输入展开、顺序校验和结果拆分；
-4. 将现有单请求 attention/Beam decision 改为消费 `B * W` 行；
-5. 固定一个 `B` 做 Decode Graph capture；
-6. 验证 Batch 结果与逐请求独立执行结果一致；
-7. 后续再考虑多 graph bucket、padding、EOS 压缩和动态 Batch。
+1. 复用现有 `BeamBatchPlan`、`GRStageMetadata`、`GRWorkerResult` 和
+   `GPUBeamStageRunner`，先增加 Batch 外层 metadata；
+2. 增加固定的 `request_index -> physical_row` 映射和 B 个 session 的一致性校验；
+3. 将 Scheduler 的单 session stage admission 扩展为一次收集并下发固定 Batch；
+4. 在 Worker 增加 BatchAdapter，复用现有 input/attention/Beam decision 路径，
+   先完成 B×W 输入展开、顺序校验和整批 commit；
+5. 保持 B=1 走现有路径，固定一个 `(B,W)` 做 Decode Graph capture；
+6. 用 device ACK 验证连续 stage 不依赖中间 decision 的 D2H；
+7. 验证 Batch 结果与逐请求独立执行结果一致；
+8. 后续再考虑多 graph bucket、padding、EOS 压缩和动态 Batch。
 
 最终目标不是把多个请求合并成一个逻辑请求，而是：
 
@@ -1033,7 +1186,7 @@ request B：仍在执行 Prefill chunk
 由同一个 BatchSession 管理，并显式记录 `active_prefill_requests`，全部完成后
 才整体进入 Decode。
 
-### 15.8 PR #411 的完整同步 Decode 数据流
+### 15.8 PR #411 的 Decode 数据流与实际同步点
 
 下面这张图按 PR #411 当前 NPU 路径标出了主要 Host/Device 边界：
 
@@ -1060,10 +1213,16 @@ sequenceDiagram
     D-->>W: D2H：out_token_ids/out_parent/out_log_probs
     W->>W: detach().to(cpu).tolist()
     W->>W: split_batch_decision()<br/>global parent -> local parent
-    W-->>E: B 个 request-local 同步结果
-    E-->>F: host output / bookkeeping
-    F->>F: 组装下一轮 B 个 step update
-    Note over F,D: 下一轮必须等待本轮 Host 结果，形成 CPU 控制往返
+    W-->>E: B 个 request-local Host 结果
+    alt beam_engine_driven 生效且允许续跑
+        E->>E: _beam_self_advance()<br/>在 EngineCore 内构造下一轮 update
+        E->>W: 下一轮 SchedulerOutput
+    else 未启用或 terminal/EOS/校验失败
+        E-->>F: 输出结果
+        F->>F: 组装下一轮 B 个 step update
+        F->>E: 再次下发
+    end
+    Note over E,D: 两条路径都必须先完成本轮 D2H、tolist 和 CPU 拆分
 ```
 
 按阶段展开，PR #411 的数据流是：
@@ -1080,14 +1239,16 @@ sequenceDiagram
    固定地址的 device input、KV 和 metadata，图本身不把 Beam 结果返回 Host；
 5. **图外 Beam decision**：采样和 `run_beam_decision()` 在 device 上执行，
    更新 device sequence、score 和 KV 相关状态；
-6. **同步结果回传**：当前 PR 的 NPU 兼容路径会对 decision tensor 执行
-   `value.detach().to("cpu").tolist()`，至少把 `out_token_ids`、
-   `out_token_index`、`out_log_probs` 搬回 Host，terminal step 还包括
-   `out_sequence`；
+6. **同步结果回传**：B>1 路径的 `_run_batch_worker_decision()` 会对存在的
+   `out_token_ids`、`out_token_index`、`out_log_probs`、`out_sequence` 执行
+   `detach().to("cpu").tolist()`。因此这里存在明确的 Device→Host 搬运和
+   Host 同步，不是推测；
 7. **Host 拆分和路由**：`split_batch_decision()` 在 CPU 上做 global parent
    到 local parent 的转换，并生成 B 个 request-local payload；
-8. **下一轮重新下发**：同步 bookkeeping 和 Frontend 消费 Host 结果，重新组装
-   下一轮 B 个 step update，再回到 EngineCore barrier。
+8. **下一轮有两种驱动方式**：开启 `beam_engine_driven` 且当前 decision 可以
+   续跑时，EngineCore 的 `_beam_self_advance()` 直接在进程内构造并应用下一轮
+   `BeamRequestStepUpdate`，不经过 Frontend RPC；否则回退到 Frontend 根据
+   Host 结果构造下一轮 update。两种方式都发生在第 6、7 步之后。
 
 数据搬运边界可以直接看成下面这条链路：
 
@@ -1114,7 +1275,7 @@ CPU split_batch_decision()
     ↓
 返回 B 个 request-local 结果
     ↓
-Frontend 重新构造下一轮 update
+EngineCore self-advance 或 Frontend 构造下一轮 update
 ```
 
 简单说：
@@ -1122,7 +1283,7 @@ Frontend 重新构造下一轮 update
 - Graph 和 Beam decision 中间主要在 device 上执行；
 - 每轮 decision 之后，PR #411 会把结果 D2H 到 CPU；
 - CPU 做 `tolist()`、parent 拆分和结果路由；
-- 下一轮必须等 CPU 结果回来后才能继续下发。
+- 下一轮不一定经过 Frontend，但必须等上述 Host 结果就绪后才能构造和下发。
 
 所以 PR #411 虽然有 device-resident Beam state，但控制链路仍是同步的：
 
@@ -1130,20 +1291,59 @@ Frontend 重新构造下一轮 update
 Device → Host → CPU 处理 → 下一轮下发
 ```
 
-这就是它和当前“Device 持久化、Host 只收 ACK、CPU 不等待完整结果”设计的
-根本区别。
+PR #411 **确实具有 device-resident Beam state**：sequence、beam score 和 KV
+reorder 都在 Device 上维护。问题不是“数据没有持久化”，而是“每一步的控制推进
+仍依赖 Host materialization”。这才是它和当前“Host 只收 ACK、CPU 不等待完整
+decision”的设计差异。
 
 这里的关键不是有没有 device-resident Beam buffer，而是每个 Decode step 都有
 一条强制的：
 
 ```text
-Device decision -> D2H -> CPU split/bookkeeping -> Host protocol -> 下一轮
+Device decision -> D2H/tolist -> CPU split -> EngineCore 或 Frontend 构造下一轮
 ```
 
-所以 PR #411 属于“设备上保存 Beam 状态、Host 上驱动同步 step”的方案，不是
-“设备状态自推进、Host 只收 ACK”的异步方案。
+所以 PR #411 属于“设备上保存 Beam 状态，但 Host decision 驱动 step 推进”的
+方案。EngineCore self-advance 消除了 Frontend RPC，但没有消除每步
+Device→Host→CPU 的数据依赖。
 
-### 15.9 PR #411 与当前 device-persistent 异步模型的冲突
+### 15.9 代码证据
+
+以下结论均来自 PR #411 提交 `58e139f` 的实际代码：
+
+1. `vllm_gr/v1/beam/beam_decision.py::_run_batch_worker_decision()`：
+
+   ```python
+   host = {
+       key: decision[key].detach().to("cpu").tolist()
+       for key in (
+           "out_token_ids",
+           "out_token_index",
+           "out_log_probs",
+           "out_sequence",
+       )
+       if torch.is_tensor(decision.get(key))
+   }
+   results = split_batch_decision(..., host, ...)
+   ```
+
+   这是 B>1 路径每步 D2H、同步 materialization 和 CPU split 的直接证据。
+
+2. 同文件的 `_finalize_decision()`：把 `out_sequence` 和 `out_log_probs` 写回
+   `bufs.sequence`、`bufs.beam_scores`，并在 Device 上计算 local parent、调用
+   `_reorder_kv_same_step()`。这是 PR #411 已经持久化 Device Beam/KV 状态的
+   直接证据，不能表述成“没有 Device 数据持久化”。
+
+3. `vllm_gr/v1/engine/engine_core_patch.py::make_patched_process_engine_step()`：
+   Worker 结果产生后、放入 Frontend output queue 前调用 `_beam_self_advance()`；
+   所以启用 engine-driven 时，下一轮不需要 Frontend RPC。
+
+4. `vllm_gr/v1/engine/core.py::_beam_advance_from_decision()`：从已经进入 Host 的
+   token、parent、score 构造 `BeamRequestStepUpdate`，然后调用
+   `_apply_beam_step()`。这证明 EngineCore 虽能内部续跑，仍然依赖本步 Host
+   decision，而不是只依赖一个 ACK。
+
+### 15.10 PR #411 与当前 device-persistent 异步模型的冲突
 
 你们当前模型要求：
 
@@ -1161,7 +1361,7 @@ CPU 下发 stage N
 CPU 下发 stage N
     -> 等待 sampler/decision 结果回到 Host
     -> CPU 做 parent/result 拆分
-    -> CPU 重新构造 stage N+1 的 Request update
+    -> EngineCore self-advance 或 Frontend 构造 stage N+1 update
     -> 再下发 stage N+1
 ```
 
@@ -1170,10 +1370,10 @@ CPU 下发 stage N
 
 - NPU decision 后的每步 D2H；
 - NPU 路径上的 `tolist()` 和 Host result materialization；
-- Frontend/EngineCore 对下一轮 Request update 的重新注册；
+- EngineCore 或 Frontend 对下一轮 Request update 的重新构造；
 - Host 侧 global/local parent 处理；
 - 同步 bookkeeping 对 sampled/logprob 的 Host 复制；
-- 下一轮 Decode 依赖上一轮 Host 消费完成。
+- 下一轮 Decode 依赖上一轮 Host decision 处理完成。
 
 如果要把 PR #411 的 `B×W` 执行布局迁移到当前异步模型，只能提取这些部分：
 
@@ -1195,7 +1395,7 @@ device sequence/score/parent 持久化
     -> terminal 时才做一次 compact D2H
 ```
 
-### 15.10 PR #411 与本文 BatchSession 方案的区别
+### 15.11 PR #411 与本文 BatchSession 方案的区别
 
 | 维度 | PR #411 | 本文 BatchSession 方案 |
 | --- | --- | --- |
@@ -1238,7 +1438,7 @@ flowchart TB
     end
 ```
 
-### 15.11 两种方案的主要取舍
+### 15.12 两种方案的主要取舍
 
 PR #411 的优点是改动相对局部：保留现有 Request、Scheduler 和 Session 模型，
 只在 Decode 入口增加 cohort barrier，并在 Worker 增加执行视图。B=1 兼容成本
